@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.2.3
+// @version      0.3.0
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -62,6 +62,13 @@
 
   function daysAgoStr(n) {
     return toBeijingDateStr(new Date(Date.now() - n * 86400000)) || todayStr();
+  }
+
+  function dateOffsetStr(dateStr, offset) {
+    const m = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return null;
+    const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + offset));
+    return toBeijingDateStr(dt);
   }
 
   function nowTimeStr() {
@@ -710,6 +717,7 @@
                 <option value="totalRevenue">历史总收益</option>
                 <option value="dailyRevenue">单日收益</option>
                 <option value="readers">在读人数</option>
+                <option value="readerDelta">今日新增在读</option>
                 <option value="wordsWan">总字数（万字）</option>
                 <option value="chapterNum">章节数</option>
               </select>
@@ -831,14 +839,28 @@
     const totalRevenueAll = books.reduce((s, b) => s + toNum(b.totalRevenue), 0);
     const totalReaders = books.reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0);
 
+    const prevDate = dateOffsetStr(latest.date, -1);
+    const previous = prevDate ? records.find((r) => r.date === prevDate) : null;
+    const newRevenueTotal = books.reduce((s, b) => s + toNum(b.yesterdayDelta), 0);
+    const newReadersTotal = books.reduce((s, b) => {
+      const cur = b.readers == null ? 0 : toNum(b.readers);
+      let prev = 0;
+      if (previous) {
+        const prevBook = previous.books.find((p) => p.title === b.title);
+        prev = prevBook && prevBook.readers != null ? toNum(prevBook.readers) : 0;
+      }
+      return s + (cur - prev);
+    }, 0);
+
     summaryEl.innerHTML = [
       statCard('数据日期', latest.date),
       statCard('记录天数', String(records.length)),
       statCard('追踪书籍', String(books.length)),
-      statCard('今日有收益', String(earningBooks.length)),
+      statCard('今日新增收益', (newRevenueTotal > 0 ? '+' : '') + '¥' + newRevenueTotal.toFixed(2)),
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
       statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
       statCard('今日总在读', fmtNum(totalReaders)),
+      statCard('今日新增总在读', (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
     ].join('');
 
     const trendData = records.map((r) => ({
@@ -917,14 +939,26 @@
       return;
     }
 
-    const data = series.map((s) => ({
-      date: s.date,
-      value: s.book[metric] == null ? null : toNum(s.book[metric]),
-    }));
+    const recordByDate = new Map(store.records.map((r) => [r.date, r]));
+    const data = series.map((s) => {
+      let value;
+      if (metric === 'readerDelta') {
+        const cur = s.book.readers == null ? 0 : toNum(s.book.readers);
+        const prevDate = dateOffsetStr(s.date, -1);
+        const prevRecord = prevDate ? recordByDate.get(prevDate) : null;
+        const prevBook = prevRecord ? prevRecord.books.find((b) => b.title === bookTitle) : null;
+        const prev = prevBook && prevBook.readers != null ? toNum(prevBook.readers) : 0;
+        value = cur - prev;
+      } else {
+        value = s.book[metric] == null ? 0 : toNum(s.book[metric]);
+      }
+      return { date: s.date, value };
+    });
     const metricLabels = {
       totalRevenue: '历史总收益（元）',
       dailyRevenue: '单日收益（元）',
       readers: '在读人数（人）',
+      readerDelta: '今日新增在读（人）',
       wordsWan: '总字数（万字）',
       chapterNum: '章节数（章）',
     };
@@ -986,12 +1020,11 @@
       return;
     }
 
-    const min = Math.min(0, ...values);
-    const max = Math.max(...values);
-    const range = max - min || 1;
-    const stepY = niceStep(range / 4);
-    const yMax = Math.ceil(max / stepY) * stepY;
-    const yMin = Math.floor(min / stepY) * stepY;
+    const rawMax = Math.max(...values);
+    const rawMin = Math.min(0, ...values);
+    // 动态上限：取最高点向上取整；全 0 时也至少显示到 1
+    const yMax = Math.max(Math.ceil(rawMax), 1);
+    const yMin = Math.min(0, Math.floor(rawMin));
     const yRange = yMax - yMin || 1;
 
     let svg = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;font-family:system-ui,-apple-system,sans-serif;">`;
@@ -1280,9 +1313,19 @@
     }
     #wawaStatsRoot .wawa-summary-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: repeat(4, 1fr);
       gap: 12px;
       margin-bottom: 18px;
+    }
+    @media (max-width: 1100px) {
+      #wawaStatsRoot .wawa-summary-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+    @media (max-width: 600px) {
+      #wawaStatsRoot .wawa-summary-grid {
+        grid-template-columns: 1fr;
+      }
     }
     #wawaStatsRoot .wawa-stat-card {
       background: #fff;
@@ -1290,6 +1333,12 @@
       border-radius: 14px;
       padding: 14px 16px;
       box-shadow: 0 1px 3px rgba(0, 0, 0, .03);
+      transition: transform .15s, box-shadow .15s, border-color .15s;
+    }
+    #wawaStatsRoot .wawa-stat-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(15, 23, 42, .08);
+      border-color: #D7F0E3;
     }
     #wawaStatsRoot .wawa-stat-label {
       font-size: 12px;
