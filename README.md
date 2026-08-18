@@ -36,7 +36,7 @@ Tampermonkey 是一个浏览器扩展，用来运行这类脚本。
 
 1. 打开本脚本的 Greasy Fork 页面（需要自行挂梯）。
 
-`https://greasyfork.org/zh-CN/scripts/591889-wawa-%E5%B0%8F%E8%AF%B4%E6%95%B0%E6%8D%AE%E8%AE%B0%E5%BD%95%E4%B8%8E%E7%BB%9F%E8%AE%A1`
+`https://greasyfork.org/zh-CN/scripts/591889`
 
 1. 点击绿色的 **“安装此脚本”** 按钮。
 2. Tampermonkey 会弹出安装确认页面。

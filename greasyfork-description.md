@@ -46,7 +46,7 @@
 ## 安装方法
 
 1. 安装浏览器扩展 Tampermonkey（Edge/Chrome/Firefox 均可）。
-2. 打开本脚本的 Greasy Fork 页面，点击“安装此脚本”。
+2. 打开本脚本的 Greasy Fork 页面：`https://greasyfork.org/zh-CN/scripts/591889`，点击“安装此脚本”。
 3. 安装完成后，打开并登录：
    `https://wawawriter.com/app/submission`
 4. 刷新页面，脚本会自动开始工作。
