@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.2.2
+// @version      0.2.3
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -828,6 +828,7 @@
     const books = latest.books || [];
     const earningBooks = books.filter((b) => toNum(b.dailyRevenue) > 0);
     const totalDaily = books.reduce((s, b) => s + toNum(b.dailyRevenue), 0);
+    const totalRevenueAll = books.reduce((s, b) => s + toNum(b.totalRevenue), 0);
     const totalReaders = books.reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0);
 
     summaryEl.innerHTML = [
@@ -836,6 +837,7 @@
       statCard('追踪书籍', String(books.length)),
       statCard('今日有收益', String(earningBooks.length)),
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
+      statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
       statCard('今日总在读', fmtNum(totalReaders)),
     ].join('');
 
