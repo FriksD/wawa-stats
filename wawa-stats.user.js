@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.3.1
+// @version      0.3.2
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -841,15 +841,15 @@
 
     const prevDate = dateOffsetStr(latest.date, -1);
     const previous = prevDate ? records.find((r) => r.date === prevDate) : null;
-    const newReadersTotal = books.reduce((s, b) => {
-      const cur = b.readers == null ? 0 : toNum(b.readers);
-      let prev = 0;
-      if (previous) {
+    // 前一天没有数据时，不把“前一天”默认成 0，而是显示“无”
+    let newReadersTotal = null;
+    if (previous) {
+      newReadersTotal = books.reduce((s, b) => {
         const prevBook = previous.books.find((p) => p.title === b.title);
-        prev = prevBook && prevBook.readers != null ? toNum(prevBook.readers) : 0;
-      }
-      return s + (cur - prev);
-    }, 0);
+        if (b.readers == null || !prevBook || prevBook.readers == null) return s;
+        return s + (toNum(b.readers) - toNum(prevBook.readers));
+      }, 0);
+    }
 
     summaryEl.innerHTML = [
       statCard('数据日期', latest.date),
@@ -859,7 +859,7 @@
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
       statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
       statCard('今日总在读', fmtNum(totalReaders)),
-      statCard('今日新增总在读', (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
+      statCard('今日新增总在读', newReadersTotal == null ? '无' : (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
     ].join('');
 
     const trendData = records.map((r) => ({
@@ -942,12 +942,15 @@
     const data = series.map((s) => {
       let value;
       if (metric === 'readerDelta') {
-        const cur = s.book.readers == null ? 0 : toNum(s.book.readers);
         const prevDate = dateOffsetStr(s.date, -1);
         const prevRecord = prevDate ? recordByDate.get(prevDate) : null;
         const prevBook = prevRecord ? prevRecord.books.find((b) => b.title === bookTitle) : null;
-        const prev = prevBook && prevBook.readers != null ? toNum(prevBook.readers) : 0;
-        value = cur - prev;
+        if (s.book.readers == null || !prevBook || prevBook.readers == null) {
+          // 前一天没有数据时，显示 0，而不是把前一天默认成 0 去算增量
+          value = 0;
+        } else {
+          value = toNum(s.book.readers) - toNum(prevBook.readers);
+        }
       } else {
         value = s.book[metric] == null ? 0 : toNum(s.book[metric]);
       }
