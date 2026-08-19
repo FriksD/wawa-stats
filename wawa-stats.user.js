@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.4.0
+// @version      0.4.1
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -548,31 +548,27 @@
       return null;
     }
 
-    // 按每本书自己的 statDate 分组写入，不再把所有书强行塞进同一个日期
-    const grouped = new Map();
-    books.forEach((b) => {
-      const date = b.statDate || todayStr();
-      if (!grouped.has(date)) grouped.set(date, []);
-      grouped.get(date).push(b);
+    // 用当前能拿到的最新真实数据日期作为本次快照的日期。
+    // 每本书内部仍然保留自己的 statDate，避免把不同时间戳的书混成同一个日期。
+    const maxStatDate = books.reduce((max, b) => {
+      if (b.statDate && (!max || b.statDate > max)) return b.statDate;
+      return max;
+    }, null);
+    const recordDate = maxStatDate || todayStr();
+
+    upsertBooksByDate(recordDate, books, {
+      localCaptureDate: todayStr(),
+      timestampSource: hasTimestamp ? 'api' : 'local',
+      serverTime: apiRes.serverTime,
+      preUpdate: !afterUpdate,
     });
 
-    const savedDates = [];
-    for (const [date, groupBooks] of grouped) {
-      upsertBooksByDate(date, groupBooks, {
-        localCaptureDate: todayStr(),
-        timestampSource: hasTimestamp ? 'api' : 'local',
-        serverTime: apiRes.serverTime,
-        preUpdate: !afterUpdate,
-      });
-      savedDates.push(date);
-    }
-
-    if (!quiet) showToast(`✅ 已记录 ${books.length} 本书（${savedDates.join(', ')}）`, 'success');
-    console.log('[WAWA Stats] records saved', savedDates, books);
+    if (!quiet) showToast(`✅ 已记录 ${books.length} 本书（${recordDate}）`, 'success');
+    console.log('[WAWA Stats] record saved', recordDate, books);
     if (window.__wawaStatsModal && window.__wawaStatsModal.isOpen()) {
       window.__wawaStatsModal.refresh();
     }
-    return { dates: savedDates, books };
+    return { date: recordDate, books };
   }
 
   // ========== 自动触发 ==========
@@ -986,12 +982,18 @@
     const tableWrap = document.getElementById('wawaTableWrap');
     if (!chartEl || !tableWrap) return;
 
-    const series = store.records
-      .map((rec) => {
-        const book = rec.books.find((b) => b.title === bookTitle);
-        return book ? { date: rec.date, rec, book } : null;
-      })
-      .filter(Boolean);
+    // 同一本书可能出现在多个快照里，但 statDate 相同的数据只保留最新一份
+    const seen = new Map();
+    store.records.forEach((rec) => {
+      const book = rec.books.find((b) => b.title === bookTitle);
+      if (!book) return;
+      const key = book.statDate || rec.date;
+      const existing = seen.get(key);
+      if (!existing || rec.date > existing.recDate) {
+        seen.set(key, { date: key, rec, book, recDate: rec.date });
+      }
+    });
+    const series = Array.from(seen.values()).sort((a, b) => a.date.localeCompare(b.date));
 
     if (!series.length) {
       chartEl.innerHTML = '<div class="wawa-empty">请选择一本书查看详情</div>';
@@ -1126,13 +1128,40 @@
       svg += `<path d="${linePath}" fill="none" stroke="#31C47A" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>`;
       validPts.forEach((p) => {
         svg += `<circle cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="3.5" fill="#fff" stroke="#31C47A" stroke-width="2"/>`;
-        svg += `<title>${escapeHtml(p.d.date)}：${fmtNum(p.d.value)}</title>`;
       });
     }
 
     svg += `<text x="${PL}" y="16" font-size="12" fill="#86909C">${escapeHtml(label)}</text>`;
     svg += '</svg>';
-    container.innerHTML = svg;
+    container.style.position = 'relative';
+    container.innerHTML = svg + '<div class="wawa-chart-tip" style="display:none"></div>';
+    const svgEl = container.querySelector('svg');
+    const tip = container.querySelector('.wawa-chart-tip');
+    if (svgEl && tip && validPts.length) {
+      svgEl.addEventListener('mousemove', (e) => {
+        const rect = svgEl.getBoundingClientRect();
+        const scaleX = W / rect.width;
+        const x = (e.clientX - rect.left) * scaleX;
+        let nearest = null;
+        let minDist = Infinity;
+        validPts.forEach((p) => {
+          const dist = Math.abs(p.x - x);
+          if (dist < minDist) {
+            minDist = dist;
+            nearest = p;
+          }
+        });
+        if (nearest) {
+          tip.style.display = 'block';
+          tip.style.left = (e.clientX - rect.left + 14) + 'px';
+          tip.style.top = (e.clientY - rect.top - 8) + 'px';
+          tip.textContent = `${nearest.d.date}：${fmtNum(nearest.d.value)}`;
+        }
+      });
+      svgEl.addEventListener('mouseleave', () => {
+        tip.style.display = 'none';
+      });
+    }
   }
 
   const DONUT_COLORS = ['#31C47A', '#4E8CF5', '#F7B500', '#F53F3F', '#8B5CF6', '#06B6D4', '#F472B6', '#84CC16', '#F97316', '#64748B'];
@@ -1219,11 +1248,19 @@
         showToast('请先选择一本书', 'warn');
         return;
       }
+      const seen = new Map();
       store.records.forEach((rec) => {
         const book = rec.books.find((b) => b.title === bookTitle);
         if (!book) return;
+        const key = book.statDate || rec.date;
+        const existing = seen.get(key);
+        if (!existing || rec.date > existing.recDate) {
+          seen.set(key, { rec, book, recDate: rec.date });
+        }
+      });
+      Array.from(seen.values()).sort((a, b) => (a.book.statDate || a.rec.date).localeCompare(b.book.statDate || b.rec.date)).forEach(({ rec, book }) => {
         rows.push([
-          rec.date,
+          book.statDate || rec.date,
           book.title,
           book.chapterText || '',
           book.wordsWan == null ? '' : String(book.wordsWan),
@@ -1435,6 +1472,20 @@
     }
     #wawaStatsRoot .wawa-chart-box {
       overflow-x: auto;
+      position: relative;
+    }
+    #wawaStatsRoot .wawa-chart-tip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(17, 24, 39, .92);
+      color: #fff;
+      padding: 4px 9px;
+      border-radius: 6px;
+      font-size: 12px;
+      white-space: nowrap;
+      z-index: 10;
+      transform: translateY(-100%);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, .18);
     }
     #wawaStatsRoot .wawa-donut-box {
       display: flex;
