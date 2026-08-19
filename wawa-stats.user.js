@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.3.2
+// @version      0.4.0
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -170,22 +170,46 @@
     return store;
   }
 
-  function shouldAutoCaptureToday() {
+  // 按每本书自己的 statDate 写入对应日期的记录；同一天重复采集时只覆盖该书，不影响其他书
+  function upsertBooksByDate(date, newBooks, meta = {}) {
     const store = loadStore();
-    const records = store.records || [];
-    const latestDataDate = records.length ? records[records.length - 1].date : null;
+    let rec = store.records.find((r) => r.date === date);
+    if (!rec) {
+      rec = {
+        date,
+        localCaptureDate: meta.localCaptureDate || todayStr(),
+        timestampSource: meta.timestampSource || 'local',
+        capturedAt: new Date().toISOString(),
+        capturedAtLocal: nowTimeStr(),
+        serverTime: meta.serverTime || '',
+        preUpdate: !!meta.preUpdate,
+        books: [],
+      };
+      store.records.push(rec);
+    } else {
+      rec.capturedAt = new Date().toISOString();
+      rec.capturedAtLocal = nowTimeStr();
+      if (meta.serverTime) rec.serverTime = meta.serverTime;
+      if (meta.timestampSource) rec.timestampSource = meta.timestampSource;
+      if (meta.preUpdate !== undefined) rec.preUpdate = meta.preUpdate;
+    }
 
-    // 这个网站的数据是延迟一天的：
-    // - 8.18 14:30 后刷新的数据，latest.date 是 8.17
-    // - 8.18 14:30 前，能拿到的最新数据是 8.16
-    // 所以：
-    //   14:30 后 -> 期望最新数据日期 = 昨天
-    //   14:30 前 -> 期望最新数据日期 = 前天
-    const expectedDataDate = daysAgoStr(isAfterUpdate() ? 1 : 2);
+    newBooks.forEach((nb) => {
+      const idx = rec.books.findIndex((b) => b.title === nb.title);
+      if (idx >= 0) rec.books[idx] = nb;
+      else rec.books.push(nb);
+    });
 
-    if (!latestDataDate) return true;
-    // 只有当前最新数据日期比期望日期旧时才需要采；相等说明已经采过，不再重复
-    return latestDataDate < expectedDataDate;
+    store.records.sort((a, b) => a.date.localeCompare(b.date));
+    saveStore(store);
+    return store;
+  }
+
+  function shouldAutoCaptureToday() {
+    // 不再判断“今天该不该采”。
+    // 每本书有自己的 statDate，采集后按各自时间戳写入对应日期即可。
+    // 同一个页面会话只自动采一次（由 observeCards 控制），不会轮询。
+    return true;
   }
 
   // ========== DOM 解析 ==========
@@ -291,6 +315,8 @@
 
       let dailyRevenue = 0;
       let readers = null;
+      let previousReaders = null;
+      let previousDate = null;
       let yesterdayDelta = 0;
       let statDate = null;
 
@@ -330,6 +356,17 @@
           )
         );
         if (!yesterdayDelta) yesterdayDelta = dailyRevenue - prevValue;
+        const prevReaderRaw = firstDefined(
+          pick(prevObj, ['reader_count', 'readers', 'reading_count', 'read_num', 'read_count', 'follow_user_cnt', 'uv']),
+          null
+        );
+        previousReaders = prevReaderRaw == null ? null : toNum(prevReaderRaw);
+        previousDate = normalizeDateValue(
+          firstDefined(
+            pick(prevObj, ['date', 'stat_date', 'statDate', 'day', 'biz_date', 'updated_at', 'created_at']),
+            null
+          )
+        );
       } else if (typeof item.previous === 'number') {
         yesterdayDelta = dailyRevenue - item.previous;
       }
@@ -341,6 +378,8 @@
         dailyRevenue,
         yesterdayDelta,
         readers,
+        previousReaders,
+        previousDate,
         statDate,
         raw: item,
       };
@@ -383,6 +422,9 @@
         dailyRevenue: card.dailyRevenue ?? api?.dailyRevenue ?? 0,
         yesterdayDelta: card.yesterdayDelta ?? api?.yesterdayDelta ?? 0,
         readers: card.readers ?? api?.readers ?? null,
+        previousReaders: api?.previousReaders ?? null,
+        previousDate: api?.previousDate ?? null,
+        statDate: api?.statDate ?? null,
       };
     });
 
@@ -405,6 +447,9 @@
           dailyRevenue: api.dailyRevenue,
           yesterdayDelta: api.yesterdayDelta,
           readers: api.readers,
+          previousReaders: api.previousReaders,
+          previousDate: api.previousDate,
+          statDate: api.statDate,
         });
         titles.add(api.title);
       }
@@ -475,11 +520,10 @@
     const domCards = parseDomCards();
     const apiRes = await fetchRevenueApi();
     const apiItems = normalizeApiData(apiRes.data);
-    const apiStatDate = detectStatDate(apiItems);
     const afterUpdate = isAfterUpdate();
-    const hasTimestamp = !!apiStatDate;
+    const hasTimestamp = apiItems.some((item) => item.statDate);
 
-    // 没有时间戳且未到 14:30 时，无法确认数据是不是今天的，跳过自动记录
+    // 没有任何时间戳且未到 14:30 时，无法确认数据日期，跳过自动记录
     if (!force && !afterUpdate && !hasTimestamp) {
       const msg = `接口没有返回统计数据日期，且现在未到 ${UPDATE_HOUR}:${pad(UPDATE_MINUTE)}，为避免把前一天数据记成今天，已跳过`;
       if (!quiet) showToast(msg, 'warn');
@@ -504,26 +548,31 @@
       return null;
     }
 
-    const record = {
-      // 优先使用接口返回的统计日期；没有才用本地日期
-      date: apiStatDate || todayStr(),
-      localCaptureDate: todayStr(),
-      timestampSource: hasTimestamp ? 'api' : 'local',
-      capturedAt: new Date().toISOString(),
-      capturedAtLocal: nowTimeStr(),
-      serverTime: apiRes.serverTime,
-      preUpdate: !afterUpdate,
-      books,
-    };
+    // 按每本书自己的 statDate 分组写入，不再把所有书强行塞进同一个日期
+    const grouped = new Map();
+    books.forEach((b) => {
+      const date = b.statDate || todayStr();
+      if (!grouped.has(date)) grouped.set(date, []);
+      grouped.get(date).push(b);
+    });
 
-    upsertRecord(record);
+    const savedDates = [];
+    for (const [date, groupBooks] of grouped) {
+      upsertBooksByDate(date, groupBooks, {
+        localCaptureDate: todayStr(),
+        timestampSource: hasTimestamp ? 'api' : 'local',
+        serverTime: apiRes.serverTime,
+        preUpdate: !afterUpdate,
+      });
+      savedDates.push(date);
+    }
 
-    if (!quiet) showToast(`✅ 已记录 ${books.length} 本书（${record.date}）`, 'success');
-    console.log('[WAWA Stats] record saved', record);
+    if (!quiet) showToast(`✅ 已记录 ${books.length} 本书（${savedDates.join(', ')}）`, 'success');
+    console.log('[WAWA Stats] records saved', savedDates, books);
     if (window.__wawaStatsModal && window.__wawaStatsModal.isOpen()) {
       window.__wawaStatsModal.refresh();
     }
-    return record;
+    return { dates: savedDates, books };
   }
 
   // ========== 自动触发 ==========
@@ -833,23 +882,30 @@
       return;
     }
 
-    const books = latest.books || [];
+    // 不同书可能在不同日期更新，这里汇总每本书最新的一条记录
+    const latestBooksMap = new Map();
+    records.forEach((rec) => {
+      (rec.books || []).forEach((b) => {
+        const existing = latestBooksMap.get(b.title);
+        if (!existing || rec.date > existing._recDate) {
+          latestBooksMap.set(b.title, { ...b, _recDate: rec.date });
+        }
+      });
+    });
+    const books = Array.from(latestBooksMap.values());
     const earningBooks = books.filter((b) => toNum(b.dailyRevenue) > 0);
     const totalDaily = books.reduce((s, b) => s + toNum(b.dailyRevenue), 0);
     const totalRevenueAll = books.reduce((s, b) => s + toNum(b.totalRevenue), 0);
     const totalReaders = books.reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0);
 
-    const prevDate = dateOffsetStr(latest.date, -1);
-    const previous = prevDate ? records.find((r) => r.date === prevDate) : null;
-    // 前一天没有数据时，不把“前一天”默认成 0，而是显示“无”
+    // 每本书使用接口返回的 previousReaders（各自对应的前一条数据），不混用日期
     let newReadersTotal = null;
-    if (previous) {
-      newReadersTotal = books.reduce((s, b) => {
-        const prevBook = previous.books.find((p) => p.title === b.title);
-        if (b.readers == null || !prevBook || prevBook.readers == null) return s;
-        return s + (toNum(b.readers) - toNum(prevBook.readers));
-      }, 0);
-    }
+    let hasPreviousReaders = false;
+    books.forEach((b) => {
+      if (b.readers == null || b.previousReaders == null) return;
+      hasPreviousReaders = true;
+      newReadersTotal = (newReadersTotal || 0) + (toNum(b.readers) - toNum(b.previousReaders));
+    });
 
     summaryEl.innerHTML = [
       statCard('数据日期', latest.date),
@@ -859,7 +915,7 @@
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
       statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
       statCard('今日总在读', fmtNum(totalReaders)),
-      statCard('今日新增总在读', newReadersTotal == null ? '无' : (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
+      statCard('今日新增总在读', hasPreviousReaders ? (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal) : '无'),
     ].join('');
 
     const trendData = records.map((r) => ({
@@ -901,19 +957,24 @@
       allBooksEl.innerHTML = '<div class="wawa-empty">暂无书籍数据</div>';
       return;
     }
-    const head = '<tr><th>书名</th><th>状态</th><th>总字数</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th></th></tr>';
-    const rows = books.map((b) => `
+    const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>总字数</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
+    const rows = books.map((b) => {
+      const readerDelta = b.readers != null && b.previousReaders != null ? toNum(b.readers) - toNum(b.previousReaders) : null;
+      return `
       <tr>
         <td class="wawa-book-title">${escapeHtml(b.title)}</td>
+        <td>${escapeHtml(b.statDate || '-')}</td>
         <td>${b.status ? `<span class="wawa-badge">${escapeHtml(b.status)}</span>` : '-'}</td>
         <td>${escapeHtml(b.wordsText || '-')}</td>
         <td>¥${toNum(b.totalRevenue).toFixed(2)}</td>
         <td class="${toNum(b.dailyRevenue) > 0 ? 'wawa-money' : ''}">¥${toNum(b.dailyRevenue).toFixed(2)}</td>
         <td class="${(b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down'}">${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0}</td>
         <td>${b.readers == null ? '-' : b.readers + ' 人'}</td>
+        <td class="${readerDelta == null ? '' : (readerDelta >= 0 ? 'wawa-up' : 'wawa-down')}">${readerDelta == null ? '无' : (readerDelta > 0 ? '+' : '') + readerDelta}</td>
         <td><button class="wawa-btn-link" data-action="view-book" data-title="${escapeHtml(b.title)}">查看</button></td>
       </tr>
-    `).join('');
+    `;
+    }).join('');
     allBooksEl.innerHTML = `<table><thead>${head}</thead><tbody>${rows}</tbody></table>`;
   }
 
@@ -938,18 +999,14 @@
       return;
     }
 
-    const recordByDate = new Map(store.records.map((r) => [r.date, r]));
     const data = series.map((s) => {
       let value;
       if (metric === 'readerDelta') {
-        const prevDate = dateOffsetStr(s.date, -1);
-        const prevRecord = prevDate ? recordByDate.get(prevDate) : null;
-        const prevBook = prevRecord ? prevRecord.books.find((b) => b.title === bookTitle) : null;
-        if (s.book.readers == null || !prevBook || prevBook.readers == null) {
-          // 前一天没有数据时，显示 0，而不是把前一天默认成 0 去算增量
+        // 每本书用接口返回的 previousReaders，和它自己的时间戳一一对应
+        if (s.book.readers == null || s.book.previousReaders == null) {
           value = 0;
         } else {
-          value = toNum(s.book.readers) - toNum(prevBook.readers);
+          value = toNum(s.book.readers) - toNum(s.book.previousReaders);
         }
       } else {
         value = s.book[metric] == null ? 0 : toNum(s.book[metric]);
