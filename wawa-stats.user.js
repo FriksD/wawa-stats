@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.4.2
+// @version      0.4.3
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -990,12 +990,13 @@
     const tableWrap = document.getElementById('wawaTableWrap');
     if (!chartEl || !tableWrap) return;
 
-    // 同一本书可能出现在多个快照里，但 statDate 相同的数据只保留最新一份
+    // 复用全局概览的“真实时间戳”逻辑：
+    // 只保留有 statDate 的数据，避免本地日期/虚假日期混入单书详情
     const seen = new Map();
     store.records.forEach((rec) => {
       const book = rec.books.find((b) => b.title === bookTitle);
-      if (!book) return;
-      const key = book.statDate || rec.date;
+      if (!book || !book.statDate) return;
+      const key = book.statDate;
       const existing = seen.get(key);
       if (!existing || rec.date > existing.recDate) {
         seen.set(key, { date: key, rec, book, recDate: rec.date });
@@ -1259,16 +1260,16 @@
       const seen = new Map();
       store.records.forEach((rec) => {
         const book = rec.books.find((b) => b.title === bookTitle);
-        if (!book) return;
-        const key = book.statDate || rec.date;
+        if (!book || !book.statDate) return;
+        const key = book.statDate;
         const existing = seen.get(key);
         if (!existing || rec.date > existing.recDate) {
           seen.set(key, { rec, book, recDate: rec.date });
         }
       });
-      Array.from(seen.values()).sort((a, b) => (a.book.statDate || a.rec.date).localeCompare(b.book.statDate || b.rec.date)).forEach(({ rec, book }) => {
+      Array.from(seen.values()).sort((a, b) => a.book.statDate.localeCompare(b.book.statDate)).forEach(({ rec, book }) => {
         rows.push([
-          book.statDate || rec.date,
+          book.statDate,
           book.title,
           book.chapterText || '',
           book.wordsWan == null ? '' : String(book.wordsWan),
