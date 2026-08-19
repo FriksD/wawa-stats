@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.4.1
+// @version      0.4.2
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -914,7 +914,15 @@
       statCard('今日新增总在读', hasPreviousReaders ? (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal) : '无'),
     ].join('');
 
-    const trendData = records.map((r) => ({
+    // 只把“真实数据日期快照”画进全站趋势，过滤掉零星/伪造日期
+    const totalTrackedBooks = latestBooksMap.size;
+    const trendRecords = records.filter((r) => {
+      if (!r.books || !r.books.length) return false;
+      if (r.books.length < (totalTrackedBooks > 1 ? 2 : 1)) return false;
+      // 快照日期必须至少有一本书的 statDate 与记录日期一致
+      return r.books.some((b) => b.statDate === r.date);
+    });
+    const trendData = trendRecords.map((r) => ({
       date: r.date,
       value: (r.books || []).reduce((s, b) => s + toNum(b.dailyRevenue), 0),
     }));
