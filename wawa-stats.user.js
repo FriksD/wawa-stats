@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.4.3
+// @version      0.5.0
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -708,6 +708,22 @@
     statsModal.show();
   }
 
+  function deleteBook(title) {
+    if (!title) return;
+    if (!confirm(`确定删除《${title}》的全部历史数据吗？\n此操作不可恢复。`)) return;
+    const store = loadStore();
+    store.records.forEach((rec) => {
+      rec.books = (rec.books || []).filter((b) => b.title !== title);
+    });
+    store.records = store.records.filter((rec) => (rec.books || []).length > 0);
+    saveStore(store);
+    showToast(`已删除《${title}》的全部数据`, 'success');
+    if (statsModal && statsModal.isOpen()) {
+      populateBookSelect();
+      renderStats();
+    }
+  }
+
   function createStatsModal() {
     const root = document.createElement('div');
     root.id = 'wawaStatsRoot';
@@ -741,13 +757,21 @@
                 <div class="wawa-card-title">🥧 今日收益占比</div>
                 <div id="wawaRevenueDonut" class="wawa-donut-box"></div>
               </div>
+              <div class="wawa-card wawa-span-2">
+                <div class="wawa-card-title">👥 全站在读趋势</div>
+                <div id="wawaReaderTrend" class="wawa-chart-box"></div>
+              </div>
               <div class="wawa-card">
-                <div class="wawa-card-title">👥 在读人数分布</div>
+                <div class="wawa-card-title">🍩 在读人数分布</div>
                 <div id="wawaReaderDonut" class="wawa-donut-box"></div>
               </div>
               <div class="wawa-card wawa-span-2">
                 <div class="wawa-card-title">💰 今日收益</div>
                 <div id="wawaEarningList" class="wawa-list-box"></div>
+              </div>
+              <div class="wawa-card">
+                <div class="wawa-card-title">📊 各书总收益排行</div>
+                <div id="wawaRevenueBar" class="wawa-bar-box"></div>
               </div>
               <div class="wawa-card wawa-span-all">
                 <div class="wawa-card-title">📚 全部书籍总览</div>
@@ -785,6 +809,11 @@
     root.querySelector('#wawaBookSelect').addEventListener('change', renderBookView);
     root.querySelector('#wawaMetricSelect').addEventListener('change', renderBookView);
     root.addEventListener('click', (e) => {
+      const del = e.target.closest('[data-action="delete-book"]');
+      if (del) {
+        deleteBook(del.getAttribute('data-title'));
+        return;
+      }
       const btn = e.target.closest('[data-action="view-book"]');
       if (btn) switchToBook(btn.getAttribute('data-title'));
     });
@@ -871,9 +900,11 @@
     if (!latest) {
       summaryEl.innerHTML = statCard('提示', '还没有数据，请先采集');
       document.getElementById('wawaGlobalTrend').innerHTML = '<div class="wawa-empty">暂无数据</div>';
+      document.getElementById('wawaReaderTrend').innerHTML = '<div class="wawa-empty">暂无数据</div>';
       document.getElementById('wawaRevenueDonut').innerHTML = '<div class="wawa-empty">暂无数据</div>';
       document.getElementById('wawaReaderDonut').innerHTML = '<div class="wawa-empty">暂无数据</div>';
       document.getElementById('wawaEarningList').innerHTML = '<div class="wawa-empty">暂无数据</div>';
+      document.getElementById('wawaRevenueBar').innerHTML = '<div class="wawa-empty">暂无数据</div>';
       document.getElementById('wawaAllBooks').innerHTML = '<div class="wawa-empty">暂无数据</div>';
       return;
     }
@@ -928,6 +959,12 @@
     }));
     drawLineChart(document.getElementById('wawaGlobalTrend'), trendData, '全站单日收益（元）');
 
+    const readerTrendData = trendRecords.map((r) => ({
+      date: r.date,
+      value: (r.books || []).reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0),
+    }));
+    drawLineChart(document.getElementById('wawaReaderTrend'), readerTrendData, '全站在读人数（人）');
+
     const revenueItems = earningBooks
       .map((b) => ({ label: b.title, value: toNum(b.dailyRevenue) }))
       .sort((a, b) => b.value - a.value);
@@ -938,6 +975,12 @@
       .map((b) => ({ label: b.title, value: toNum(b.readers) }))
       .sort((a, b) => b.value - a.value);
     drawDonutChart(document.getElementById('wawaReaderDonut'), readerItems, '在读人数');
+
+    const barItems = books
+      .map((b) => ({ label: b.title, value: toNum(b.totalRevenue) }))
+      .filter((i) => i.value > 0)
+      .sort((a, b) => b.value - a.value);
+    drawBarChart(document.getElementById('wawaRevenueBar'), barItems, '总收益（元）');
 
     // 今日有收益的书
     const earningEl = document.getElementById('wawaEarningList');
@@ -975,7 +1018,10 @@
         <td class="${(b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down'}">${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0}</td>
         <td>${b.readers == null ? '-' : b.readers + ' 人'}</td>
         <td class="${readerDelta == null ? '' : (readerDelta >= 0 ? 'wawa-up' : 'wawa-down')}">${readerDelta == null ? '无' : (readerDelta > 0 ? '+' : '') + readerDelta}</td>
-        <td><button class="wawa-btn-link" data-action="view-book" data-title="${escapeHtml(b.title)}">查看</button></td>
+        <td>
+          <button class="wawa-btn-link" data-action="view-book" data-title="${escapeHtml(b.title)}">查看</button>
+          <button class="wawa-btn-link wawa-btn-danger" data-action="delete-book" data-title="${escapeHtml(b.title)}">删除</button>
+        </td>
       </tr>
     `;
     }).join('');
@@ -1217,6 +1263,28 @@
     container.innerHTML = `<div class="wawa-donut-wrap">${svg}<div class="wawa-legend">${legend}</div></div>`;
   }
 
+  function drawBarChart(container, items, label) {
+    if (!container) return;
+    const validItems = (items || []).filter((i) => toNum(i.value) > 0);
+    if (!validItems.length) {
+      container.innerHTML = '<div class="wawa-empty">暂无数据</div>';
+      return;
+    }
+    const max = Math.max(...validItems.map((i) => toNum(i.value)));
+    const rows = validItems.map((item) => {
+      const pct = max > 0 ? (toNum(item.value) / max) * 100 : 0;
+      return `
+        <div class="wawa-bar-row" title="${escapeHtml(item.label)}：${escapeHtml(label)} ${fmtNum(item.value)}">
+          <div class="wawa-bar-label">${escapeHtml(item.label)}</div>
+          <div class="wawa-bar-track">
+            <div class="wawa-bar-fill" style="width:${pct.toFixed(1)}%"></div>
+          </div>
+          <div class="wawa-bar-value">${fmtNum(item.value)}</div>
+        </div>
+      `;
+    }).join('');
+    container.innerHTML = `<div class="wawa-bar-chart">${rows}</div>`;
+  }
 
   function fmtNum(n) {
     if (Math.abs(n) >= 10000) return (n / 10000).toFixed(1) + '万';
@@ -1502,6 +1570,47 @@
       justify-content: center;
       min-height: 180px;
     }
+    #wawaStatsRoot .wawa-bar-box {
+      min-height: 180px;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+    #wawaStatsRoot .wawa-bar-chart {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #wawaStatsRoot .wawa-bar-row {
+      display: grid;
+      grid-template-columns: 84px 1fr 48px;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+    #wawaStatsRoot .wawa-bar-label {
+      color: #4B5563;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #wawaStatsRoot .wawa-bar-track {
+      height: 10px;
+      background: #F1F3F5;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    #wawaStatsRoot .wawa-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #31C47A, #ABE425);
+      min-width: 0;
+    }
+    #wawaStatsRoot .wawa-bar-value {
+      text-align: right;
+      color: #111827;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
     #wawaStatsRoot .wawa-donut-wrap {
       display: flex;
       align-items: center;
@@ -1638,6 +1747,15 @@
     }
     #wawaStatsRoot .wawa-btn-link:hover {
       background: #E5E7EB;
+    }
+    #wawaStatsRoot .wawa-btn-danger {
+      color: #F53F3F;
+      background: #FEF1F1;
+      margin-left: 6px;
+    }
+    #wawaStatsRoot .wawa-btn-danger:hover {
+      background: #FDE3E3;
+      color: #D92D20;
     }
 
     #wawaStatsRoot .wawa-toolbar {
