@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.5.0
+// @version      0.6.0
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -23,11 +23,13 @@
 
   // ========== 配置 ==========
   const STORAGE_KEY = 'wawaStats_v1';
+  const STORE_VERSION = 2;
   const API_REVENUE = '/wrhp-api/api/v1/submission/novel/my_revenue';
-  const UPDATE_HOUR = 14;
-  const UPDATE_MINUTE = 30;
+  const UPDATE_START_HOUR = 14;   // 服务器数据从 14:00 起陆续更新
+  const POLL_INTERVAL_MS = 5 * 60 * 1000; // 静默轮询间隔：5 分钟
+  const POLL_DEADLINE_HOUR = 17;  // 17:00 后停止轮询
+  const POLL_MAX_ATTEMPTS = 24;   // 轮询次数上限
   const AUTO_CAPTURE_DELAY = 4000; // 页面出现卡片后延迟自动采集
-  const ENABLE_CLICK_COLLECT = true; // API 缺少在读人数/收益时，自动点开卡片补全（会短暂展开卡片）
 
   // ========== 工具函数 ==========
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -76,9 +78,15 @@
     return `${p.year}-${pad(p.month)}-${pad(p.day)} ${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}`;
   }
 
-  function isAfterUpdate(date = new Date()) {
+  function isAfterUpdateStart(date = new Date()) {
     const p = beijingParts(date);
-    return p.hour > UPDATE_HOUR || (p.hour === UPDATE_HOUR && p.minute >= UPDATE_MINUTE);
+    return p.hour >= UPDATE_START_HOUR;
+  }
+
+  // 期望能拿到的最新数据日期：
+  // 过了 14:00 → 昨天的数据；还没到 14:00 → 前天的数据
+  function expectedDataDate() {
+    return isAfterUpdateStart() ? daysAgoStr(1) : daysAgoStr(2);
   }
 
   function toBeijingDateStr(date) {
@@ -101,13 +109,6 @@
     if (m) return `${m[1]}-${pad(Number(m[2]))}-${pad(Number(m[3]))}`;
     const d = new Date(s);
     return toBeijingDateStr(d);
-  }
-
-  function firstDefined(...args) {
-    for (const a of args) {
-      if (a !== undefined && a !== null && a !== '') return a;
-    }
-    return undefined;
   }
 
   function toNum(v) {
@@ -160,16 +161,6 @@
     }
   }
 
-  function upsertRecord(record) {
-    const store = loadStore();
-    const idx = store.records.findIndex((r) => r.date === record.date);
-    if (idx >= 0) store.records[idx] = record;
-    else store.records.push(record);
-    store.records.sort((a, b) => a.date.localeCompare(b.date));
-    saveStore(store);
-    return store;
-  }
-
   // 按每本书自己的 statDate 写入对应日期的记录；同一天重复采集时只覆盖该书，不影响其他书
   function upsertBooksByDate(date, newBooks, meta = {}) {
     const store = loadStore();
@@ -205,11 +196,47 @@
     return store;
   }
 
-  function shouldAutoCaptureToday() {
-    // 不再判断“今天该不该采”。
-    // 每本书有自己的 statDate，采集后按各自时间戳写入对应日期即可。
-    // 同一个页面会话只自动采一次（由 observeCards 控制），不会轮询。
-    return true;
+  // 一次性迁移：把历史记录里 statDate 与记录日期不一致的书，移到它自己 statDate 对应的记录里
+  function migrateStore() {
+    const store = loadStore();
+    if ((store.version || 1) >= STORE_VERSION) return;
+
+    const findOrCreateRec = (date, template) => {
+      let rec = store.records.find((r) => r.date === date);
+      if (!rec) {
+        rec = {
+          date,
+          localCaptureDate: template.localCaptureDate || template.date,
+          timestampSource: 'api',
+          capturedAt: template.capturedAt || '',
+          capturedAtLocal: template.capturedAtLocal || '',
+          serverTime: template.serverTime || '',
+          preUpdate: false,
+          books: [],
+        };
+        store.records.push(rec);
+      }
+      return rec;
+    };
+
+    let moved = 0;
+    for (const rec of store.records.slice()) {
+      const misplaced = (rec.books || []).filter((b) => b.statDate && b.statDate !== rec.date);
+      if (!misplaced.length) continue;
+      rec.books = rec.books.filter((b) => !(b.statDate && b.statDate !== rec.date));
+      for (const book of misplaced) {
+        const target = findOrCreateRec(book.statDate, rec);
+        const idx = target.books.findIndex((b) => b.title === book.title);
+        // 目标记录里已有同名书时保留原有（目标记录采集时该书就是这个日期的数据，更可信）
+        if (idx < 0) target.books.push(book);
+        moved++;
+      }
+    }
+    store.records = store.records.filter((r) => (r.books || []).length > 0);
+    store.records.sort((a, b) => a.date.localeCompare(b.date));
+    store.version = STORE_VERSION;
+    saveStore(store);
+    if (moved) console.log(`[WAWA Stats] 数据迁移完成：${moved} 条书籍数据已归位到各自的统计日期`);
   }
 
   // ========== DOM 解析 ==========
@@ -304,72 +331,26 @@
     }
   }
 
+  // 接口真实结构：
+  // { base_novel_id, title, total_revenue,
+  //   latest:   { date, revenue, follow_user_cnt, available },
+  //   previous: { date, revenue, follow_user_cnt, available } }
   function normalizeApiData(items) {
     return items.map((item) => {
       const latest = item.latest && typeof item.latest === 'object' ? item.latest : null;
       const prevObj = item.previous && typeof item.previous === 'object' ? item.previous : null;
-      const pick = (obj, keys) => {
-        for (const k of keys) if (obj[k] !== undefined && obj[k] !== null) return obj[k];
-        return undefined;
-      };
 
-      let dailyRevenue = 0;
-      let readers = null;
-      let previousReaders = null;
-      let previousDate = null;
-      let yesterdayDelta = 0;
-      let statDate = null;
+      const dailyRevenue = latest ? toNum(latest.revenue) : 0;
+      const readers = latest && latest.follow_user_cnt != null ? toNum(latest.follow_user_cnt) : null;
+      const statDate = latest ? normalizeDateValue(latest.date) : null;
+      const available = latest ? latest.available !== false : false;
 
-      if (latest) {
-        dailyRevenue = toNum(
-          firstDefined(
-            pick(latest, ['revenue', 'daily_revenue', 'today_revenue', 'amount', 'income']),
-            0
-          )
-        );
-        readers = firstDefined(
-          pick(latest, ['reader_count', 'readers', 'reading_count', 'read_num', 'read_count', 'follow_user_cnt', 'uv']),
-          null
-        );
-        readers = readers === null || readers === undefined ? null : toNum(readers);
-        yesterdayDelta = toNum(
-          firstDefined(
-            pick(latest, ['delta', 'yesterday_delta', 'diff', 'change']),
-            0
-          )
-        );
-        statDate = normalizeDateValue(
-          firstDefined(
-            pick(latest, ['date', 'stat_date', 'statDate', 'day', 'biz_date', 'updated_at', 'created_at']),
-            null
-          )
-        );
-      } else if (typeof item.latest === 'number') {
-        dailyRevenue = item.latest;
-      }
+      const prevRevenue = prevObj ? toNum(prevObj.revenue) : null;
+      const previousReaders = prevObj && prevObj.follow_user_cnt != null ? toNum(prevObj.follow_user_cnt) : null;
+      const previousDate = prevObj ? normalizeDateValue(prevObj.date) : null;
 
-      if (prevObj) {
-        const prevValue = toNum(
-          firstDefined(
-            pick(prevObj, ['revenue', 'daily_revenue', 'today_revenue', 'amount', 'income']),
-            0
-          )
-        );
-        if (!yesterdayDelta) yesterdayDelta = dailyRevenue - prevValue;
-        const prevReaderRaw = firstDefined(
-          pick(prevObj, ['reader_count', 'readers', 'reading_count', 'read_num', 'read_count', 'follow_user_cnt', 'uv']),
-          null
-        );
-        previousReaders = prevReaderRaw == null ? null : toNum(prevReaderRaw);
-        previousDate = normalizeDateValue(
-          firstDefined(
-            pick(prevObj, ['date', 'stat_date', 'statDate', 'day', 'biz_date', 'updated_at', 'created_at']),
-            null
-          )
-        );
-      } else if (typeof item.previous === 'number') {
-        yesterdayDelta = dailyRevenue - item.previous;
-      }
+      const yesterdayDelta = prevRevenue == null ? 0 : dailyRevenue - prevRevenue;
+      const readerDelta = readers != null && previousReaders != null ? readers - previousReaders : null;
 
       return {
         baseNovelId: item.base_novel_id ?? item.baseNovelId ?? null,
@@ -378,30 +359,13 @@
         dailyRevenue,
         yesterdayDelta,
         readers,
+        readerDelta,
         previousReaders,
         previousDate,
         statDate,
-        raw: item,
+        available,
       };
     });
-  }
-
-  function detectStatDate(apiItems) {
-    const counts = new Map();
-    for (const item of apiItems) {
-      if (!item.statDate) continue;
-      counts.set(item.statDate, (counts.get(item.statDate) || 0) + 1);
-    }
-    if (!counts.size) return null;
-    let best = null;
-    let bestCount = 0;
-    for (const [d, c] of counts) {
-      if (c > bestCount) {
-        best = d;
-        bestCount = c;
-      }
-    }
-    return best;
   }
 
   // ========== 合并 ==========
@@ -422,9 +386,11 @@
         dailyRevenue: card.dailyRevenue ?? api?.dailyRevenue ?? 0,
         yesterdayDelta: card.yesterdayDelta ?? api?.yesterdayDelta ?? 0,
         readers: card.readers ?? api?.readers ?? null,
+        readerDelta: api?.readerDelta ?? null,
         previousReaders: api?.previousReaders ?? null,
         previousDate: api?.previousDate ?? null,
         statDate: api?.statDate ?? null,
+        available: api ? api.available : false,
       };
     });
 
@@ -447,9 +413,11 @@
           dailyRevenue: api.dailyRevenue,
           yesterdayDelta: api.yesterdayDelta,
           readers: api.readers,
+          readerDelta: api.readerDelta,
           previousReaders: api.previousReaders,
           previousDate: api.previousDate,
           statDate: api.statDate,
+          available: api.available,
         });
         titles.add(api.title);
       }
@@ -520,20 +488,12 @@
     const domCards = parseDomCards();
     const apiRes = await fetchRevenueApi();
     const apiItems = normalizeApiData(apiRes.data);
-    const afterUpdate = isAfterUpdate();
     const hasTimestamp = apiItems.some((item) => item.statDate);
-
-    // 没有任何时间戳且未到 14:30 时，无法确认数据日期，跳过自动记录
-    if (!force && !afterUpdate && !hasTimestamp) {
-      const msg = `接口没有返回统计数据日期，且现在未到 ${UPDATE_HOUR}:${pad(UPDATE_MINUTE)}，为避免把前一天数据记成今天，已跳过`;
-      if (!quiet) showToast(msg, 'warn');
-      console.log('[WAWA Stats]', msg);
-      return null;
-    }
 
     let books = mergeData(domCards, apiItems);
 
-    if (ENABLE_CLICK_COLLECT && books.some((b) => b.readers == null || b.dailyRevenue == null || b.totalRevenue == null)) {
+    // 仅手动强采且 API 没返回数据时，才点开卡片兜底补全（自动路径完全无感知）
+    if (force && !hasTimestamp && books.some((b) => b.readers == null || b.dailyRevenue == null || b.totalRevenue == null)) {
       showBanner('正在展开卡片补全收益/在读数据…');
       try {
         books = await collectReadersFromCards(books);
@@ -544,35 +504,61 @@
     }
 
     if (!books.length) {
-      showToast('没有采集到任何书籍数据', 'error');
+      if (!quiet) showToast('没有采集到任何书籍数据', 'error');
       return null;
     }
 
-    // 用当前能拿到的最新真实数据日期作为本次快照的日期。
-    // 每本书内部仍然保留自己的 statDate，避免把不同时间戳的书混成同一个日期。
-    const maxStatDate = books.reduce((max, b) => {
-      if (b.statDate && (!max || b.statDate > max)) return b.statDate;
-      return max;
-    }, null);
-    const recordDate = maxStatDate || todayStr();
-
-    upsertBooksByDate(recordDate, books, {
-      localCaptureDate: todayStr(),
-      timestampSource: hasTimestamp ? 'api' : 'local',
-      serverTime: apiRes.serverTime,
-      preUpdate: !afterUpdate,
-    });
-
-    if (!quiet) showToast(`✅ 已记录 ${books.length} 本书（${recordDate}）`, 'success');
-    console.log('[WAWA Stats] record saved', recordDate, books);
-    if (window.__wawaStatsModal && window.__wawaStatsModal.isOpen()) {
-      window.__wawaStatsModal.refresh();
+    // 按每本书自己的 statDate 分组入库：8-22 的书写进 8-22 的记录，绝不混日期
+    const groups = new Map();
+    let saved = 0;
+    for (const book of books) {
+      let date = book.statDate;
+      if (!date) {
+        if (!force) continue; // 自动采集：没有时间戳的书直接跳过
+        date = expectedDataDate(); // 手动强采：落到推断的数据日期
+      }
+      if (!groups.has(date)) groups.set(date, []);
+      groups.get(date).push(book);
+      saved++;
     }
-    return { date: recordDate, books };
+
+    if (!groups.size) {
+      const msg = '接口没有返回带日期的统计数据，本次跳过';
+      if (!quiet) showToast(msg, 'warn');
+      console.log('[WAWA Stats]', msg);
+      return null;
+    }
+
+    const dates = Array.from(groups.keys()).sort();
+    for (const [date, group] of groups) {
+      upsertBooksByDate(date, group, {
+        localCaptureDate: todayStr(),
+        timestampSource: group.some((b) => b.statDate) ? 'api' : 'local',
+        serverTime: apiRes.serverTime,
+        preUpdate: !isAfterUpdateStart(),
+      });
+    }
+
+    // 相对期望日期统计同步进度（只看 API 返回的书）
+    const expected = expectedDataDate();
+    const apiTotal = apiItems.length;
+    const freshCount = apiItems.filter((i) => i.statDate && i.statDate >= expected).length;
+
+    if (!quiet) showToast(`✅ 已记录 ${saved} 本书（${dates.join(' / ')}）`, 'success');
+    console.log(`[WAWA Stats] 已入库 ${saved} 本 → ${dates.join(', ')}；最新数据 ${freshCount}/${apiTotal} 本`);
+    if (statsModal && statsModal.isOpen()) {
+      statsModal.refresh();
+    }
+    return { dates, books, freshCount, total: apiTotal, saved };
   }
 
-  // ========== 自动触发 ==========
+  // ========== 自动触发：智能静默轮询 ==========
+  // 服务器数据每天 14:00 起陆续更新（每本书时间不同，可能持续到 14:30+）。
+  // 策略：页面打开静默采一次；若有书落后于期望日期，在 14:00~17:00 窗口内
+  // 每 5 分钟纯 API 静默重采，直到所有书都拿到最新数据；窗口外等下一个 14:00。
   let autoCapturing = false;
+  let pollTimer = null;
+  let pollAttempts = 0;
 
   function debounce(fn, wait) {
     let t = null;
@@ -582,61 +568,85 @@
     };
   }
 
-  function observeCards() {
-    let autoCaptureSessionDone = false;
-    let observer = null;
-
-    const tryAuto = debounce(() => {
-      if (autoCapturing) return;
-      // 同一个页面会话只自动采集一次，避免 MutationObserver 导致反复轮询
-      if (autoCaptureSessionDone) return;
-      if (!document.querySelector('.submission-item')) return;
-      if (!shouldAutoCaptureToday()) {
-        // 当前没有需要自动采集的新数据，直接断开监听，不再遍历页面元素
-        if (observer) observer.disconnect();
-        return;
-      }
-
-      autoCapturing = true;
-      setTimeout(async () => {
-        try {
-          await captureNow({ quiet: true });
-        } catch (e) {
-          console.error('[WAWA Stats] auto capture failed', e);
-        } finally {
-          autoCapturing = false;
-          // 无论成功、跳过还是失败，本会话都不再自动重试；14:30 的定时任务仍会触发一次
-          autoCaptureSessionDone = true;
-          if (observer) observer.disconnect();
-        }
-      }, AUTO_CAPTURE_DELAY);
-    }, 1200);
-
-    observer = new MutationObserver(tryAuto);
-    observer.observe(document.body, { childList: true, subtree: true });
-    tryAuto();
+  // 距离下一个北京时间 14:00 的毫秒数（加 1 分钟缓冲）
+  function msUntilNextUpdateWindow() {
+    const p = beijingParts();
+    const nowMins = p.hour * 60 + p.minute;
+    let diffMins = UPDATE_START_HOUR * 60 - nowMins;
+    if (diffMins <= 0) diffMins += 24 * 60;
+    return (diffMins + 1) * 60 * 1000;
   }
 
-  function scheduleBeforeUpdate() {
-    if (isAfterUpdate()) return;
-    const now = new Date();
-    const next = new Date(now);
-    next.setHours(UPDATE_HOUR, UPDATE_MINUTE, 0, 0);
-    if (next <= now) next.setDate(next.getDate() + 1);
-    const delay = Math.max(1000, next - now);
-    setTimeout(async () => {
-      if (!isAfterUpdate()) return;
-      if (!shouldAutoCaptureToday()) {
-        console.log('[WAWA Stats] 已是最新数据，14:30 跳过重复采集');
-        return;
-      }
-      showToast('⏰ 已到 14:30，开始自动采集今日数据…');
-      try {
-        await captureNow({});
-      } catch (e) {
-        console.error(e);
-      }
-    }, delay);
+  function scheduleSync(delayMs, resetAttempts) {
+    if (pollTimer) clearTimeout(pollTimer);
+    if (resetAttempts) pollAttempts = 0;
+    pollTimer = setTimeout(syncTick, delayMs);
+  }
+
+  async function syncTick() {
+    pollTimer = null;
+
+    // 后台标签页不发请求，等下个间隔再试
+    if (document.visibilityState === 'hidden') {
+      scheduleSync(POLL_INTERVAL_MS, false);
+      return;
+    }
+    if (autoCapturing) {
+      scheduleSync(POLL_INTERVAL_MS, false);
+      return;
+    }
+
+    autoCapturing = true;
+    let result = null;
+    try {
+      result = await captureNow({ quiet: true });
+    } catch (e) {
+      console.error('[WAWA Stats] 自动同步失败', e);
+    } finally {
+      autoCapturing = false;
+    }
+
+    const complete = result && result.total > 0 && result.freshCount >= result.total;
+    if (complete) {
+      console.log(`[WAWA Stats] ✅ 全部 ${result.total} 本书已同步到最新数据（${result.dates.join(', ')}），等待下一个更新窗口`);
+      scheduleSync(msUntilNextUpdateWindow(), true);
+      return;
+    }
+
+    const p = beijingParts();
+    const inWindow = p.hour >= UPDATE_START_HOUR && p.hour < POLL_DEADLINE_HOUR;
+    if (!inWindow) {
+      // 窗口外数据不齐说明服务器还没出新数据，等下一个 14:00
+      console.log(`[WAWA Stats] 同步进度 ${result ? `${result.freshCount}/${result.total}` : '失败'}，等待下一个 14:00 更新窗口`);
+      scheduleSync(msUntilNextUpdateWindow(), true);
+      return;
+    }
+    if (pollAttempts >= POLL_MAX_ATTEMPTS) {
+      console.log('[WAWA Stats] 轮询达到次数上限，等待下一个更新窗口');
+      scheduleSync(msUntilNextUpdateWindow(), true);
+      return;
+    }
+    pollAttempts++;
+    console.log(`[WAWA Stats] 同步进度 ${result ? `${result.freshCount}/${result.total}` : '失败'}，${POLL_INTERVAL_MS / 60000} 分钟后静默重试（第 ${pollAttempts} 次）`);
+    scheduleSync(POLL_INTERVAL_MS, false);
+  }
+
+  function observeCards() {
+    let started = false;
+    let observer = null;
+
+    const tryStart = debounce(() => {
+      if (started) return;
+      if (!document.querySelector('.submission-item')) return;
+      started = true;
+      if (observer) observer.disconnect();
+      // 卡片渲染稳定后启动第一次静默同步，后续节奏由 syncTick 自己接管
+      scheduleSync(AUTO_CAPTURE_DELAY, true);
+    }, 1200);
+
+    observer = new MutationObserver(tryStart);
+    observer.observe(document.body, { childList: true, subtree: true });
+    tryStart();
   }
 
   // ========== UI：浮动按钮 / Toast / Banner ==========
@@ -653,9 +663,7 @@
 
     document.getElementById('wawaStatsBtn').addEventListener('click', openStatsModal);
     document.getElementById('wawaCaptureBtn').addEventListener('click', async () => {
-      if (!isAfterUpdate()) {
-        if (!confirm('当前还未到 14:30，网站数据可能还没更新。\n仍要强制记录当前快照吗？')) return;
-      }
+      // 数据按每本书自己的 statDate 入库，任何时间手动采集都不会记错日期
       await captureNow({ force: true });
     });
   }
@@ -766,12 +774,20 @@
                 <div id="wawaReaderDonut" class="wawa-donut-box"></div>
               </div>
               <div class="wawa-card wawa-span-2">
+                <div class="wawa-card-title">💹 全站累计总收益趋势</div>
+                <div id="wawaCumulativeTrend" class="wawa-chart-box"></div>
+              </div>
+              <div class="wawa-card">
+                <div class="wawa-card-title">📅 近7日 vs 前7日</div>
+                <div id="wawaWeekCompare" class="wawa-compare-box"></div>
+              </div>
+              <div class="wawa-card wawa-span-2">
                 <div class="wawa-card-title">💰 今日收益</div>
                 <div id="wawaEarningList" class="wawa-list-box"></div>
               </div>
               <div class="wawa-card">
-                <div class="wawa-card-title">📊 各书总收益排行</div>
-                <div id="wawaRevenueBar" class="wawa-bar-box"></div>
+                <div class="wawa-card-title">🗓️ 月度统计</div>
+                <div id="wawaMonthly" class="wawa-table-box wawa-monthly-box"></div>
               </div>
               <div class="wawa-card wawa-span-all">
                 <div class="wawa-card-title">📚 全部书籍总览</div>
@@ -782,16 +798,16 @@
           <div id="wawaBookView" class="wawa-view" style="display:none">
             <div class="wawa-toolbar">
               <select id="wawaBookSelect"></select>
-              <select id="wawaMetricSelect">
-                <option value="totalRevenue">历史总收益</option>
-                <option value="dailyRevenue">单日收益</option>
-                <option value="readers">在读人数</option>
-                <option value="readerDelta">今日新增在读</option>
-                <option value="wordsWan">总字数（万字）</option>
-                <option value="chapterNum">章节数</option>
-              </select>
             </div>
-            <div class="wawa-card"><div id="wawaChart" class="wawa-chart-box"></div></div>
+            <div id="wawaBookSummary" class="wawa-summary-grid"></div>
+            <div class="wawa-card">
+              <div class="wawa-card-title">💰 单日收益趋势</div>
+              <div id="wawaBookRevenueChart" class="wawa-chart-box"></div>
+            </div>
+            <div class="wawa-card">
+              <div class="wawa-card-title">👥 在读人数趋势</div>
+              <div id="wawaBookReaderChart" class="wawa-chart-box"></div>
+            </div>
             <div class="wawa-card"><div id="wawaTableWrap" class="wawa-table-box"></div></div>
           </div>
         </div>
@@ -807,7 +823,6 @@
       tab.addEventListener('click', () => switchView(tab.dataset.view));
     });
     root.querySelector('#wawaBookSelect').addEventListener('change', renderBookView);
-    root.querySelector('#wawaMetricSelect').addEventListener('change', renderBookView);
     root.addEventListener('click', (e) => {
       const del = e.target.closest('[data-action="delete-book"]');
       if (del) {
@@ -880,32 +895,32 @@
     return select ? select.value : '';
   }
 
-  function getSelectedMetric() {
-    const select = document.getElementById('wawaMetricSelect');
-    return select ? select.value : 'totalRevenue';
-  }
-
   function renderStats() {
     if (currentView === 'global') renderGlobalView();
     else renderBookView();
   }
 
+  // 每本书的新增在读：优先用接口算好的 readerDelta，老数据回退到 readers - previousReaders
+  function bookReaderDelta(b) {
+    if (b.readerDelta != null) return toNum(b.readerDelta);
+    if (b.readers != null && b.previousReaders != null) return toNum(b.readers) - toNum(b.previousReaders);
+    return null;
+  }
+
   function renderGlobalView() {
     const store = loadStore();
     const records = store.records || [];
-    const latest = records[records.length - 1];
     const summaryEl = document.getElementById('wawaSummary');
     if (!summaryEl) return;
 
-    if (!latest) {
+    const setEmpty = (id) => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '<div class="wawa-empty">暂无数据</div>';
+    };
+
+    if (!records.length) {
       summaryEl.innerHTML = statCard('提示', '还没有数据，请先采集');
-      document.getElementById('wawaGlobalTrend').innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      document.getElementById('wawaReaderTrend').innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      document.getElementById('wawaRevenueDonut').innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      document.getElementById('wawaReaderDonut').innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      document.getElementById('wawaEarningList').innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      document.getElementById('wawaRevenueBar').innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      document.getElementById('wawaAllBooks').innerHTML = '<div class="wawa-empty">暂无数据</div>';
+      ['wawaGlobalTrend', 'wawaReaderTrend', 'wawaCumulativeTrend', 'wawaRevenueDonut', 'wawaReaderDonut', 'wawaWeekCompare', 'wawaMonthly', 'wawaEarningList', 'wawaAllBooks'].forEach(setEmpty);
       return;
     }
 
@@ -920,29 +935,37 @@
       });
     });
     const books = Array.from(latestBooksMap.values());
-    const earningBooks = books.filter((b) => toNum(b.dailyRevenue) > 0);
-    const totalDaily = books.reduce((s, b) => s + toNum(b.dailyRevenue), 0);
+
+    // 当前数据日期 = 各书最新记录中最大的日期。
+    // 只有更新到这一天的书才计入“今日”类汇总，避免把旧日期的增量混进来。
+    const dataDate = books.reduce((max, b) => (b._recDate > max ? b._recDate : max), '');
+    books.forEach((b) => { b._isFresh = b._recDate === dataDate; });
+    const freshBooks = books.filter((b) => b._isFresh);
+    const staleCount = books.length - freshBooks.length;
+
+    const earningBooks = freshBooks.filter((b) => toNum(b.dailyRevenue) > 0);
+    const totalDaily = freshBooks.reduce((s, b) => s + toNum(b.dailyRevenue), 0);
     const totalRevenueAll = books.reduce((s, b) => s + toNum(b.totalRevenue), 0);
     const totalReaders = books.reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0);
 
-    // 每本书使用接口返回的 previousReaders（各自对应的前一条数据），不混用日期
+    // 今日新增在读：只统计已更新到 dataDate 的书
     let newReadersTotal = null;
-    let hasPreviousReaders = false;
-    books.forEach((b) => {
-      if (b.readers == null || b.previousReaders == null) return;
-      hasPreviousReaders = true;
-      newReadersTotal = (newReadersTotal || 0) + (toNum(b.readers) - toNum(b.previousReaders));
+    freshBooks.forEach((b) => {
+      const d = bookReaderDelta(b);
+      if (d == null) return;
+      newReadersTotal = (newReadersTotal || 0) + d;
     });
 
     summaryEl.innerHTML = [
-      statCard('数据日期', latest.date),
-      statCard('记录天数', String(records.length)),
+      statCard('数据日期', dataDate),
+      statCard('更新进度', staleCount ? `${freshBooks.length}/${books.length} 本` : '已全部更新', staleCount ? 'warn' : ''),
       statCard('追踪书籍', String(books.length)),
-      statCard('今日有收益', String(earningBooks.length)),
+      statCard('记录天数', String(records.length)),
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
+      statCard('今日有收益', String(earningBooks.length) + ' 本'),
       statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
-      statCard('今日总在读', fmtNum(totalReaders)),
-      statCard('今日新增总在读', hasPreviousReaders ? (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal) : '无'),
+      statCard('总在读', fmtNum(totalReaders)),
+      statCard('今日新增在读', newReadersTotal == null ? '无' : (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
     ].join('');
 
     // 只把“真实数据日期快照”画进全站趋势，过滤掉零星/伪造日期
@@ -965,6 +988,26 @@
     }));
     drawLineChart(document.getElementById('wawaReaderTrend'), readerTrendData, '全站在读人数（人）');
 
+    // 累计总收益趋势：每个日期对每本书取“当日或之前最近一次”的 totalRevenue（carry-forward），
+    // 避免某本书某天缺记录导致曲线下凹
+    const trendDates = new Set(trendRecords.map((r) => r.date));
+    const lastKnownTotal = new Map();
+    const cumulativeData = [];
+    records.forEach((rec) => {
+      (rec.books || []).forEach((b) => {
+        if (b.totalRevenue != null) lastKnownTotal.set(b.title, toNum(b.totalRevenue));
+      });
+      if (trendDates.has(rec.date)) {
+        let sum = 0;
+        lastKnownTotal.forEach((v) => { sum += v; });
+        cumulativeData.push({ date: rec.date, value: Math.round(sum * 100) / 100 });
+      }
+    });
+    drawLineChart(document.getElementById('wawaCumulativeTrend'), cumulativeData, '全站累计总收益（元）');
+
+    renderWeekCompare(document.getElementById('wawaWeekCompare'), trendRecords);
+    renderMonthlyStats(document.getElementById('wawaMonthly'), trendRecords);
+
     const revenueItems = earningBooks
       .map((b) => ({ label: b.title, value: toNum(b.dailyRevenue) }))
       .sort((a, b) => b.value - a.value);
@@ -976,26 +1019,23 @@
       .sort((a, b) => b.value - a.value);
     drawDonutChart(document.getElementById('wawaReaderDonut'), readerItems, '在读人数');
 
-    const barItems = books
-      .map((b) => ({ label: b.title, value: toNum(b.totalRevenue) }))
-      .filter((i) => i.value > 0)
-      .sort((a, b) => b.value - a.value);
-    drawBarChart(document.getElementById('wawaRevenueBar'), barItems, '总收益（元）');
-
     // 今日有收益的书
     const earningEl = document.getElementById('wawaEarningList');
     if (!earningBooks.length) {
       earningEl.innerHTML = '<div class="wawa-empty">零蛋！</div>';
     } else {
-      earningEl.innerHTML = earningBooks.map((b) => `
+      earningEl.innerHTML = earningBooks.map((b) => {
+        const d = bookReaderDelta(b);
+        return `
         <div class="wawa-earning-row">
           <div class="wawa-earning-main">
             <div class="wawa-earning-title">${escapeHtml(b.title)}</div>
-            <div class="wawa-earning-meta">昨日 ${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0} · 在读 ${b.readers == null ? '-' : b.readers + ' 人'}</div>
+            <div class="wawa-earning-meta">昨日 ${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0} · 在读 ${b.readers == null ? '-' : b.readers + ' 人'}${d == null ? '' : ` · 新增 ${d > 0 ? '+' : ''}${d}`}</div>
           </div>
           <div class="wawa-earning-amount">+¥${toNum(b.dailyRevenue).toFixed(2)}</div>
         </div>
-      `).join('');
+      `;
+      }).join('');
     }
 
     // 全部书籍总览
@@ -1005,12 +1045,16 @@
       return;
     }
     const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>总字数</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
-    const rows = books.map((b) => {
-      const readerDelta = b.readers != null && b.previousReaders != null ? toNum(b.readers) - toNum(b.previousReaders) : null;
-      return `
-      <tr>
+    const rows = books
+      .slice()
+      .sort((a, b) => toNum(b.totalRevenue) - toNum(a.totalRevenue) || toNum(b.readers) - toNum(a.readers))
+      .map((b) => {
+        const readerDelta = bookReaderDelta(b);
+        const dateCell = escapeHtml(b.statDate || b._recDate || '-') + (b._isFresh ? '' : ' <span class="wawa-badge-stale">未更新</span>');
+        return `
+      <tr class="${b._isFresh ? '' : 'wawa-row-stale'}">
         <td class="wawa-book-title">${escapeHtml(b.title)}</td>
-        <td>${escapeHtml(b.statDate || '-')}</td>
+        <td>${dateCell}</td>
         <td>${b.status ? `<span class="wawa-badge">${escapeHtml(b.status)}</span>` : '-'}</td>
         <td>${escapeHtml(b.wordsText || '-')}</td>
         <td>¥${toNum(b.totalRevenue).toFixed(2)}</td>
@@ -1024,81 +1068,161 @@
         </td>
       </tr>
     `;
-    }).join('');
+      }).join('');
     allBooksEl.innerHTML = `<table><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+  }
+
+  // 近7日 vs 前7日：收益与新增在读的环比对比
+  function renderWeekCompare(container, trendRecords) {
+    if (!container) return;
+    if (!trendRecords.length) {
+      container.innerHTML = '<div class="wawa-empty">暂无数据</div>';
+      return;
+    }
+    const recent = trendRecords.slice(-7);
+    const prev = trendRecords.slice(-14, -7);
+    const sumRevenue = (recs) => recs.reduce((s, r) => s + (r.books || []).reduce((x, b) => x + toNum(b.dailyRevenue), 0), 0);
+    const sumReaderDelta = (recs) => recs.reduce((s, r) => s + (r.books || []).reduce((x, b) => {
+      const d = bookReaderDelta(b);
+      return x + (d == null ? 0 : d);
+    }, 0), 0);
+
+    const blocks = [
+      { label: '收益', cur: sumRevenue(recent), pre: prev.length ? sumRevenue(prev) : null, fmt: (v) => '¥' + v.toFixed(2) },
+      { label: '新增在读', cur: sumReaderDelta(recent), pre: prev.length ? sumReaderDelta(prev) : null, fmt: (v) => fmtNum(v) + ' 人' },
+    ];
+    container.innerHTML = blocks.map((blk) => {
+      let compareHtml = '<span class="wawa-compare-na">前7日数据不足，暂无对比</span>';
+      if (blk.pre != null) {
+        const diff = Math.round((blk.cur - blk.pre) * 100) / 100;
+        const cls = diff >= 0 ? 'wawa-up' : 'wawa-down';
+        const arrow = diff >= 0 ? '▲' : '▼';
+        const pct = blk.pre !== 0 ? `（${diff >= 0 ? '+' : ''}${((diff / Math.abs(blk.pre)) * 100).toFixed(1)}%）` : '';
+        compareHtml = `<span class="${cls}">${arrow} ${diff >= 0 ? '+' : ''}${fmtNum(diff)}${pct}</span> <span class="wawa-compare-na">vs 前${prev.length}天</span>`;
+      }
+      return `<div class="wawa-compare-block">
+        <div class="wawa-compare-label">近${recent.length}日${blk.label}</div>
+        <div class="wawa-compare-value">${blk.fmt(blk.cur)}</div>
+        <div class="wawa-compare-diff">${compareHtml}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // 月度统计：按月份汇总每日收益与新增在读（例如查看 7 月总收益）
+  function renderMonthlyStats(container, trendRecords) {
+    if (!container) return;
+    if (!trendRecords.length) {
+      container.innerHTML = '<div class="wawa-empty">暂无数据</div>';
+      return;
+    }
+    const byMonth = new Map(); // '2026-07' -> { days, revenue, readerDelta }
+    trendRecords.forEach((r) => {
+      const month = r.date.slice(0, 7);
+      if (!byMonth.has(month)) byMonth.set(month, { days: 0, revenue: 0, readerDelta: 0 });
+      const m = byMonth.get(month);
+      m.days++;
+      (r.books || []).forEach((b) => {
+        m.revenue += toNum(b.dailyRevenue);
+        const d = bookReaderDelta(b);
+        if (d != null) m.readerDelta += d;
+      });
+    });
+    const months = Array.from(byMonth.entries()).sort((a, b) => b[0].localeCompare(a[0])); // 最新月份在前
+    const head = '<tr><th>月份</th><th>收益</th><th>新增在读</th><th>记录</th></tr>';
+    const rows = months.map(([month, m]) => `<tr>
+      <td>${escapeHtml(month)}</td>
+      <td class="${m.revenue > 0 ? 'wawa-money' : ''}">¥${m.revenue.toFixed(2)}</td>
+      <td class="${m.readerDelta >= 0 ? 'wawa-up' : 'wawa-down'}">${m.readerDelta > 0 ? '+' : ''}${fmtNum(m.readerDelta)}</td>
+      <td>${m.days} 天</td>
+    </tr>`).join('');
+    container.innerHTML = `<table class="wawa-table-compact"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+  }
+
+  // 构建单书按 statDate 去重后的时间序列（renderBookView / exportCsv 共用）
+  function buildBookSeries(records, bookTitle) {
+    const seen = new Map();
+    (records || []).forEach((rec) => {
+      const book = (rec.books || []).find((b) => b.title === bookTitle);
+      if (!book || !book.statDate) return;
+      const key = book.statDate;
+      const existing = seen.get(key);
+      if (!existing || rec.date > existing.recDate) {
+        seen.set(key, { date: key, book, recDate: rec.date });
+      }
+    });
+    const series = Array.from(seen.values()).sort((a, b) => a.date.localeCompare(b.date));
+    // 逐条算新增在读：优先接口给的 readerDelta；老数据回退为与上一条的差值（仅相邻 1 天时才可比）
+    series.forEach((s, i) => {
+      let delta = bookReaderDelta(s.book);
+      if (delta == null && i > 0) {
+        const prev = series[i - 1];
+        if (dateOffsetStr(s.date, -1) === prev.date && s.book.readers != null && prev.book.readers != null) {
+          delta = toNum(s.book.readers) - toNum(prev.book.readers);
+        }
+      }
+      s.delta = delta;
+    });
+    return series;
   }
 
   function renderBookView() {
     const store = loadStore();
     const bookTitle = getSelectedBook();
-    const metric = getSelectedMetric();
-    const chartEl = document.getElementById('wawaChart');
+    const summaryEl = document.getElementById('wawaBookSummary');
+    const revenueChartEl = document.getElementById('wawaBookRevenueChart');
+    const readerChartEl = document.getElementById('wawaBookReaderChart');
     const tableWrap = document.getElementById('wawaTableWrap');
-    if (!chartEl || !tableWrap) return;
+    if (!revenueChartEl || !readerChartEl || !tableWrap) return;
 
-    // 复用全局概览的“真实时间戳”逻辑：
-    // 只保留有 statDate 的数据，避免本地日期/虚假日期混入单书详情
-    const seen = new Map();
-    store.records.forEach((rec) => {
-      const book = rec.books.find((b) => b.title === bookTitle);
-      if (!book || !book.statDate) return;
-      const key = book.statDate;
-      const existing = seen.get(key);
-      if (!existing || rec.date > existing.recDate) {
-        seen.set(key, { date: key, rec, book, recDate: rec.date });
-      }
-    });
-    const series = Array.from(seen.values()).sort((a, b) => a.date.localeCompare(b.date));
+    const series = bookTitle ? buildBookSeries(store.records, bookTitle) : [];
 
     if (!series.length) {
-      chartEl.innerHTML = '<div class="wawa-empty">请选择一本书查看详情</div>';
+      if (summaryEl) summaryEl.innerHTML = '';
+      revenueChartEl.innerHTML = '<div class="wawa-empty">请选择一本书查看详情</div>';
+      readerChartEl.innerHTML = '<div class="wawa-empty">暂无数据</div>';
       tableWrap.innerHTML = '';
       return;
     }
 
-    const data = series.map((s) => {
-      let value;
-      if (metric === 'readerDelta') {
-        // 每本书用接口返回的 previousReaders，和它自己的时间戳一一对应
-        if (s.book.readers == null || s.book.previousReaders == null) {
-          value = 0;
-        } else {
-          value = toNum(s.book.readers) - toNum(s.book.previousReaders);
-        }
-      } else {
-        value = s.book[metric] == null ? 0 : toNum(s.book[metric]);
-      }
-      return { date: s.date, value };
-    });
-    const metricLabels = {
-      totalRevenue: '历史总收益（元）',
-      dailyRevenue: '单日收益（元）',
-      readers: '在读人数（人）',
-      readerDelta: '今日新增在读（人）',
-      wordsWan: '总字数（万字）',
-      chapterNum: '章节数（章）',
-    };
-    drawLineChart(chartEl, data, metricLabels[metric] || metric);
+    const latest = series[series.length - 1];
+    if (summaryEl) {
+      summaryEl.innerHTML = [
+        statCard('最新数据日期', latest.date),
+        statCard('累计总收益', '¥' + toNum(latest.book.totalRevenue).toFixed(2)),
+        statCard('最新单日收益', '¥' + toNum(latest.book.dailyRevenue).toFixed(2)),
+        statCard('在读人数', latest.book.readers == null ? '-' : fmtNum(toNum(latest.book.readers))),
+        statCard('最新新增在读', latest.delta == null ? '无' : (latest.delta > 0 ? '+' : '') + fmtNum(latest.delta)),
+        statCard('已记录天数', String(series.length)),
+      ].join('');
+    }
 
-    const head = '<tr><th>日期</th><th>章节</th><th>总字数</th><th>状态</th><th>历史总收益</th><th>单日收益</th><th>昨日</th><th>在读</th></tr>';
-    const rows = series.map((s) => {
+    drawLineChart(
+      revenueChartEl,
+      series.map((s) => ({ date: s.date, value: toNum(s.book.dailyRevenue) })),
+      '单日收益（元）'
+    );
+    drawLineChart(
+      readerChartEl,
+      series.map((s) => ({ date: s.date, value: s.book.readers == null ? null : toNum(s.book.readers) })),
+      '在读人数（人）'
+    );
+
+    const head = '<tr><th>日期</th><th>单日收益</th><th>累计总收益</th><th>在读</th><th>新增在读</th></tr>';
+    const rows = series.slice().reverse().map((s) => {
       const b = s.book;
       return `<tr>
         <td>${escapeHtml(s.date)}</td>
-        <td>${escapeHtml(b.chapterText || '-')}</td>
-        <td>${escapeHtml(b.wordsText || '-')}</td>
-        <td>${escapeHtml(b.status || '-')}</td>
+        <td class="${toNum(b.dailyRevenue) > 0 ? 'wawa-money' : ''}">¥${toNum(b.dailyRevenue).toFixed(2)}</td>
         <td>¥${toNum(b.totalRevenue).toFixed(2)}</td>
-        <td>¥${toNum(b.dailyRevenue).toFixed(2)}</td>
-        <td class="${(b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down'}">${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0}</td>
-        <td>${b.readers == null ? '-' : b.readers + ' 人'}</td>
+        <td>${b.readers == null ? '-' : fmtNum(toNum(b.readers)) + ' 人'}</td>
+        <td class="${s.delta == null ? '' : (s.delta >= 0 ? 'wawa-up' : 'wawa-down')}">${s.delta == null ? '-' : (s.delta > 0 ? '+' : '') + s.delta}</td>
       </tr>`;
     }).join('');
-    tableWrap.innerHTML = `<table><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+    tableWrap.innerHTML = `<table class="wawa-table-compact"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
   }
 
-  function statCard(label, value) {
-    return `<div class="wawa-stat-card">
+  function statCard(label, value, variant = '') {
+    return `<div class="wawa-stat-card${variant ? ' wawa-stat-' + variant : ''}">
       <div class="wawa-stat-label">${escapeHtml(label)}</div>
       <div class="wawa-stat-value">${escapeHtml(value)}</div>
     </div>`;
@@ -1114,14 +1238,6 @@
   }
 
   // ========== SVG 折线图 ==========
-  function niceStep(raw) {
-    if (!raw || raw <= 0) return 1;
-    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
-    const norm = raw / mag;
-    const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
-    return step * mag;
-  }
-
   function drawLineChart(container, data, label) {
     const W = 820;
     const H = 280;
@@ -1263,29 +1379,6 @@
     container.innerHTML = `<div class="wawa-donut-wrap">${svg}<div class="wawa-legend">${legend}</div></div>`;
   }
 
-  function drawBarChart(container, items, label) {
-    if (!container) return;
-    const validItems = (items || []).filter((i) => toNum(i.value) > 0);
-    if (!validItems.length) {
-      container.innerHTML = '<div class="wawa-empty">暂无数据</div>';
-      return;
-    }
-    const max = Math.max(...validItems.map((i) => toNum(i.value)));
-    const rows = validItems.map((item) => {
-      const pct = max > 0 ? (toNum(item.value) / max) * 100 : 0;
-      return `
-        <div class="wawa-bar-row" title="${escapeHtml(item.label)}：${escapeHtml(label)} ${fmtNum(item.value)}">
-          <div class="wawa-bar-label">${escapeHtml(item.label)}</div>
-          <div class="wawa-bar-track">
-            <div class="wawa-bar-fill" style="width:${pct.toFixed(1)}%"></div>
-          </div>
-          <div class="wawa-bar-value">${fmtNum(item.value)}</div>
-        </div>
-      `;
-    }).join('');
-    container.innerHTML = `<div class="wawa-bar-chart">${rows}</div>`;
-  }
-
   function fmtNum(n) {
     if (Math.abs(n) >= 10000) return (n / 10000).toFixed(1) + '万';
     if (Number.isInteger(n)) return String(n);
@@ -1300,7 +1393,7 @@
       return;
     }
     const rows = [];
-    rows.push(['日期', '书名', '章节', '总字数(万)', '总字数原文', '状态', '历史总收益', '单日收益', '昨日变化', '在读人数']);
+    rows.push(['日期', '书名', '章节', '总字数(万)', '总字数原文', '状态', '历史总收益', '单日收益', '昨日变化', '在读人数', '新增在读']);
 
     if (currentView === 'global') {
       store.records.forEach((rec) => {
@@ -1316,6 +1409,7 @@
             book.dailyRevenue == null ? '' : String(book.dailyRevenue),
             book.yesterdayDelta == null ? '' : String(book.yesterdayDelta),
             book.readers == null ? '' : String(book.readers),
+            bookReaderDelta(book) == null ? '' : String(bookReaderDelta(book)),
           ]);
         });
       });
@@ -1325,19 +1419,10 @@
         showToast('请先选择一本书', 'warn');
         return;
       }
-      const seen = new Map();
-      store.records.forEach((rec) => {
-        const book = rec.books.find((b) => b.title === bookTitle);
-        if (!book || !book.statDate) return;
-        const key = book.statDate;
-        const existing = seen.get(key);
-        if (!existing || rec.date > existing.recDate) {
-          seen.set(key, { rec, book, recDate: rec.date });
-        }
-      });
-      Array.from(seen.values()).sort((a, b) => a.book.statDate.localeCompare(b.book.statDate)).forEach(({ rec, book }) => {
+      buildBookSeries(store.records, bookTitle).forEach((s) => {
+        const book = s.book;
         rows.push([
-          book.statDate,
+          s.date,
           book.title,
           book.chapterText || '',
           book.wordsWan == null ? '' : String(book.wordsWan),
@@ -1347,6 +1432,7 @@
           book.dailyRevenue == null ? '' : String(book.dailyRevenue),
           book.yesterdayDelta == null ? '' : String(book.yesterdayDelta),
           book.readers == null ? '' : String(book.readers),
+          s.delta == null ? '' : String(s.delta),
         ]);
       });
     }
@@ -1486,19 +1572,9 @@
     }
     #wawaStatsRoot .wawa-summary-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 12px;
       margin-bottom: 18px;
-    }
-    @media (max-width: 1100px) {
-      #wawaStatsRoot .wawa-summary-grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-    }
-    @media (max-width: 600px) {
-      #wawaStatsRoot .wawa-summary-grid {
-        grid-template-columns: 1fr;
-      }
     }
     #wawaStatsRoot .wawa-stat-card {
       background: #fff;
@@ -1532,6 +1608,12 @@
     }
     #wawaStatsRoot .wawa-span-2 { grid-column: span 2; }
     #wawaStatsRoot .wawa-span-all { grid-column: 1 / -1; }
+    @media (max-width: 900px) {
+      #wawaStatsRoot .wawa-dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+      #wawaStatsRoot .wawa-span-2 { grid-column: span 1; }
+    }
 
     #wawaStatsRoot .wawa-card {
       background: #fff;
@@ -1570,46 +1652,65 @@
       justify-content: center;
       min-height: 180px;
     }
-    #wawaStatsRoot .wawa-bar-box {
-      min-height: 180px;
-      max-height: 240px;
-      overflow-y: auto;
-    }
-    #wawaStatsRoot .wawa-bar-chart {
+    #wawaStatsRoot .wawa-compare-box {
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 12px;
+      min-height: 180px;
+      justify-content: center;
     }
-    #wawaStatsRoot .wawa-bar-row {
-      display: grid;
-      grid-template-columns: 84px 1fr 48px;
-      align-items: center;
-      gap: 8px;
+    #wawaStatsRoot .wawa-compare-block {
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: #F8FAFB;
+      border: 1px solid #F1F3F5;
+    }
+    #wawaStatsRoot .wawa-compare-label {
       font-size: 12px;
+      color: #9AA1AB;
+      margin-bottom: 4px;
     }
-    #wawaStatsRoot .wawa-bar-label {
-      color: #4B5563;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    #wawaStatsRoot .wawa-bar-track {
-      height: 10px;
-      background: #F1F3F5;
-      border-radius: 999px;
-      overflow: hidden;
-    }
-    #wawaStatsRoot .wawa-bar-fill {
-      height: 100%;
-      border-radius: 999px;
-      background: linear-gradient(90deg, #31C47A, #ABE425);
-      min-width: 0;
-    }
-    #wawaStatsRoot .wawa-bar-value {
-      text-align: right;
+    #wawaStatsRoot .wawa-compare-value {
+      font-size: 20px;
+      font-weight: 700;
       color: #111827;
+      line-height: 1.2;
+    }
+    #wawaStatsRoot .wawa-compare-diff {
+      font-size: 12px;
+      margin-top: 4px;
       font-weight: 600;
-      font-variant-numeric: tabular-nums;
+    }
+    #wawaStatsRoot .wawa-compare-na {
+      color: #9AA1AB;
+      font-weight: 400;
+    }
+    #wawaStatsRoot .wawa-table-box {
+      overflow: auto;
+      max-height: 420px;
+    }
+    #wawaStatsRoot .wawa-monthly-box {
+      max-height: 260px;
+    }
+    #wawaStatsRoot .wawa-table-compact {
+      min-width: 0 !important;
+    }
+    #wawaStatsRoot .wawa-badge-stale {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 6px;
+      background: #F3F4F6;
+      color: #9AA1AB;
+      font-size: 11px;
+    }
+    #wawaStatsRoot .wawa-row-stale td {
+      color: #9AA1AB;
+    }
+    #wawaStatsRoot .wawa-stat-warn .wawa-stat-value {
+      color: #FF8F1F;
+    }
+    #wawaStatsRoot #wawaBookView .wawa-card {
+      margin-bottom: 16px;
     }
     #wawaStatsRoot .wawa-donut-wrap {
       display: flex;
@@ -1781,6 +1882,7 @@
     #wawaStatsRoot .wawa-toolbar select:first-child {
       flex: 1;
       min-width: 220px;
+      max-width: 480px;
     }
 
     #wawaStatsRoot .wawa-empty {
@@ -1795,16 +1897,16 @@
 
   // ========== 初始化 ==========
   function init() {
+    migrateStore();
     addFloatingButtons();
     observeCards();
-    scheduleBeforeUpdate();
     try {
       GM_registerMenuCommand('📥 立即采集今日数据', () => captureNow({ force: true }));
       GM_registerMenuCommand('📊 打开数据统计', openStatsModal);
     } catch (e) {
       // 某些环境不支持菜单命令，忽略
     }
-    console.log('[WAWA Stats] 脚本已加载，今日：' + todayStr() + '，14:30 后自动采集');
+    console.log('[WAWA Stats] 脚本已加载，今日：' + todayStr() + '，将在数据更新窗口内静默同步');
   }
 
   if (document.readyState === 'loading') {
