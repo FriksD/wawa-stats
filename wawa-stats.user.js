@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.6.0
+// @version      0.6.1
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -1324,9 +1324,23 @@
         });
         if (nearest) {
           tip.style.display = 'block';
-          tip.style.left = (e.clientX - rect.left + 14) + 'px';
-          tip.style.top = (e.clientY - rect.top - 8) + 'px';
           tip.textContent = `${nearest.d.date}：${fmtNum(nearest.d.value)}`;
+          // 先隐藏测量宽度，避免在容器外渲染造成抖动/滚动条
+          tip.style.left = '0px';
+          tip.style.visibility = 'hidden';
+          const tipWidth = tip.offsetWidth;
+          tip.style.visibility = '';
+          const offsetX = e.clientX - rect.left;
+          const gap = 14;
+          const rightPlaceLeft = offsetX + gap;
+          let left = rightPlaceLeft;
+          // 右侧空间不足时翻转到鼠标左侧，保证最右边的最新数据提示也能完整显示
+          if (rightPlaceLeft + tipWidth > rect.width) {
+            left = offsetX - tipWidth - gap;
+          }
+          left = Math.max(0, Math.min(left, rect.width - tipWidth));
+          tip.style.left = left + 'px';
+          tip.style.top = (e.clientY - rect.top - 8) + 'px';
         }
       });
       svgEl.addEventListener('mouseleave', () => {
