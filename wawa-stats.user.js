@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.6.2
+// @version      0.6.3
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -128,6 +128,10 @@
       return Number.isFinite(n) ? n : 0;
     }
     return 0;
+  }
+
+  function round2(n) {
+    return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
   }
 
   function parseChapterNum(text) {
@@ -287,7 +291,7 @@
         const dailyM = valueText.match(/(\d+(?:\.\d+)?)\s*元/);
         result.dailyRevenue = dailyM ? parseFloat(dailyM[1]) : 0;
         const deltaM = valueText.match(/昨日\s*([+-]\d+(?:\.\d+)?)/);
-        result.yesterdayDelta = deltaM ? parseFloat(deltaM[1]) : 0;
+        result.yesterdayDelta = deltaM ? round2(parseFloat(deltaM[1])) : 0;
       } else if (label.includes('在读人数')) {
         const readerM = valueText.match(/(\d+(?:\.\d+)?)\s*人/);
         result.readers = readerM ? parseFloat(readerM[1]) : null;
@@ -377,7 +381,7 @@
       const previousReaders = prevObj && prevObj.follow_user_cnt != null ? toNum(prevObj.follow_user_cnt) : null;
       const previousDate = prevObj ? normalizeDateValue(prevObj.date) : null;
 
-      const yesterdayDelta = prevRevenue == null ? 0 : dailyRevenue - prevRevenue;
+      const yesterdayDelta = prevRevenue == null ? 0 : round2(dailyRevenue - prevRevenue);
       const readerDelta = readers != null && previousReaders != null ? readers - previousReaders : null;
 
       return {
@@ -1092,7 +1096,7 @@
         <div class="wawa-earning-row">
           <div class="wawa-earning-main">
             <div class="wawa-earning-title">${escapeHtml(b.title)}</div>
-            <div class="wawa-earning-meta">昨日 ${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0} · 在读 ${b.readers == null ? '-' : b.readers + ' 人'}${d == null ? '' : ` · 新增 ${d > 0 ? '+' : ''}${d}`}</div>
+            <div class="wawa-earning-meta">昨日 ${(round2(b.yesterdayDelta ?? 0) >= 0 ? '+' : '') + round2(b.yesterdayDelta ?? 0)} · 在读 ${b.readers == null ? '-' : b.readers + ' 人'}${d == null ? '' : ` · 新增 ${d > 0 ? '+' : ''}${d}`}</div>
           </div>
           <div class="wawa-earning-amount">+¥${toNum(b.dailyRevenue).toFixed(2)}</div>
         </div>
@@ -1127,7 +1131,7 @@
         <td>${escapeHtml(b.wordsText || '-')}</td>
         <td>${isPending ? '-' : '¥' + toNum(b.totalRevenue).toFixed(2)}</td>
         <td class="${isPending ? '' : (toNum(b.dailyRevenue) > 0 ? 'wawa-money' : '')}">${isPending ? '-' : '¥' + toNum(b.dailyRevenue).toFixed(2)}</td>
-        <td class="${isPending ? '' : ((b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : ((b.yesterdayDelta ?? 0) >= 0 ? '+' : '') + (b.yesterdayDelta ?? 0)}</td>
+        <td class="${isPending ? '' : ((b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : ((round2(b.yesterdayDelta ?? 0) >= 0 ? '+' : '') + round2(b.yesterdayDelta ?? 0))}</td>
         <td>${b.readers == null ? '-' : b.readers + ' 人'}</td>
         <td class="${readerDelta == null ? '' : (readerDelta >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : (readerDelta == null ? '无' : (readerDelta > 0 ? '+' : '') + readerDelta)}</td>
         <td>
@@ -1504,7 +1508,7 @@
             book.status || '',
             book.totalRevenue == null ? '' : String(book.totalRevenue),
             book.dailyRevenue == null ? '' : String(book.dailyRevenue),
-            book.yesterdayDelta == null ? '' : String(book.yesterdayDelta),
+            book.yesterdayDelta == null ? '' : String(round2(book.yesterdayDelta)),
             book.readers == null ? '' : String(book.readers),
             bookReaderDelta(book) == null ? '' : String(bookReaderDelta(book)),
           ]);
@@ -1527,7 +1531,7 @@
           book.status || '',
           book.totalRevenue == null ? '' : String(book.totalRevenue),
           book.dailyRevenue == null ? '' : String(book.dailyRevenue),
-          book.yesterdayDelta == null ? '' : String(book.yesterdayDelta),
+          book.yesterdayDelta == null ? '' : String(round2(book.yesterdayDelta)),
           book.readers == null ? '' : String(book.readers),
           s.delta == null ? '' : String(s.delta),
         ]);
