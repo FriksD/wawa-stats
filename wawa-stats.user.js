@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.6.1
+// @version      0.6.2
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -111,6 +111,16 @@
     return toBeijingDateStr(d);
   }
 
+  // 网站数据是延迟一天发布的：今天/未来的日期不是真实数据日期，而是“暂无数据”的占位
+  function isNoDataDate(dateStr) {
+    const d = normalizeDateValue(dateStr);
+    return !!d && d >= todayStr();
+  }
+
+  function isNoDataBook(book) {
+    return !!book && isNoDataDate(book.statDate);
+  }
+
   function toNum(v) {
     if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
     if (typeof v === 'string') {
@@ -145,11 +155,14 @@
   function loadStore() {
     try {
       const v = GM_getValue(STORAGE_KEY, { records: [] });
-      if (v && Array.isArray(v.records)) return v;
+      if (v && Array.isArray(v.records)) {
+        v.pendingBooks = Array.isArray(v.pendingBooks) ? v.pendingBooks : [];
+        return v;
+      }
     } catch (e) {
       console.error('[WAWA Stats] loadStore failed', e);
     }
-    return { records: [] };
+    return { records: [], pendingBooks: [] };
   }
 
   function saveStore(store) {
@@ -192,6 +205,21 @@
     });
 
     store.records.sort((a, b) => a.date.localeCompare(b.date));
+    saveStore(store);
+    return store;
+  }
+
+  // 新签约/暂无真实数据的书单独留在“书单”里，不写入历史日期记录，避免污染统计
+  function upsertPendingBooks(newBooks) {
+    const store = loadStore();
+    if (!newBooks || !newBooks.length) return store;
+    if (!Array.isArray(store.pendingBooks)) store.pendingBooks = [];
+    newBooks.forEach((nb) => {
+      const item = { ...nb, isPlaceholder: true, statDate: null };
+      const idx = store.pendingBooks.findIndex((b) => b.title === item.title);
+      if (idx >= 0) store.pendingBooks[idx] = item;
+      else store.pendingBooks.push(item);
+    });
     saveStore(store);
     return store;
   }
@@ -488,7 +516,7 @@
     const domCards = parseDomCards();
     const apiRes = await fetchRevenueApi();
     const apiItems = normalizeApiData(apiRes.data);
-    const hasTimestamp = apiItems.some((item) => item.statDate);
+    const hasTimestamp = apiItems.some((item) => item.statDate && !isNoDataDate(item.statDate));
 
     let books = mergeData(domCards, apiItems);
 
@@ -508,10 +536,16 @@
       return null;
     }
 
-    // 按每本书自己的 statDate 分组入库：8-22 的书写进 8-22 的记录，绝不混日期
+    // 按每本书自己的 statDate 分组入库：8-22 的书写进 8-22 的记录，绝不混日期。
+    // 今天（或未来）日期的书是刚签约、还没正式数据的占位书，不进 records，只进 pendingBooks。
     const groups = new Map();
+    const pendingBooks = [];
     let saved = 0;
     for (const book of books) {
+      if (isNoDataBook(book)) {
+        pendingBooks.push(book);
+        continue;
+      }
       let date = book.statDate;
       if (!date) {
         if (!force) continue; // 自动采集：没有时间戳的书直接跳过
@@ -522,7 +556,10 @@
       saved++;
     }
 
-    if (!groups.size) {
+    upsertPendingBooks(pendingBooks);
+    const pendingCount = pendingBooks.length;
+
+    if (!groups.size && !pendingCount) {
       const msg = '接口没有返回带日期的统计数据，本次跳过';
       if (!quiet) showToast(msg, 'warn');
       console.log('[WAWA Stats]', msg);
@@ -539,17 +576,20 @@
       });
     }
 
-    // 相对期望日期统计同步进度（只看 API 返回的书）
+    // 相对期望日期统计同步进度（只看 API 返回的正式数据书）
     const expected = expectedDataDate();
-    const apiTotal = apiItems.length;
-    const freshCount = apiItems.filter((i) => i.statDate && i.statDate >= expected).length;
+    const validApiItems = apiItems.filter((i) => !isNoDataDate(i.statDate));
+    const apiTotal = validApiItems.length;
+    const freshCount = validApiItems.filter((i) => i.statDate && i.statDate >= expected).length;
 
-    if (!quiet) showToast(`✅ 已记录 ${saved} 本书（${dates.join(' / ')}）`, 'success');
-    console.log(`[WAWA Stats] 已入库 ${saved} 本 → ${dates.join(', ')}；最新数据 ${freshCount}/${apiTotal} 本`);
+    const pendingTip = pendingCount ? `，${pendingCount} 本暂无数据已在书单中` : '';
+    const savedTip = saved ? `已记录 ${saved} 本书（${dates.join(' / ')}）` : '没有正式数据入库';
+    if (!quiet) showToast(`✅ ${savedTip}${pendingTip}`, 'success');
+    console.log(`[WAWA Stats] 已入库 ${saved} 本 → ${dates.join(', ') || '暂无正式日期'}；最新数据 ${freshCount}/${apiTotal} 本${pendingTip}`);
     if (statsModal && statsModal.isOpen()) {
       statsModal.refresh();
     }
-    return { dates, books, freshCount, total: apiTotal, saved };
+    return { dates, books, freshCount, total: apiTotal, saved, pendingCount };
   }
 
   // ========== 自动触发：智能静默轮询 ==========
@@ -604,6 +644,12 @@
       console.error('[WAWA Stats] 自动同步失败', e);
     } finally {
       autoCapturing = false;
+    }
+
+    if (result && result.total === 0 && result.pendingCount > 0) {
+      console.log('[WAWA Stats] 当前仅有暂无数据的书，等待下一个更新窗口');
+      scheduleSync(msUntilNextUpdateWindow(), true);
+      return;
     }
 
     const complete = result && result.total > 0 && result.freshCount >= result.total;
@@ -724,6 +770,7 @@
       rec.books = (rec.books || []).filter((b) => b.title !== title);
     });
     store.records = store.records.filter((rec) => (rec.books || []).length > 0);
+    store.pendingBooks = (Array.isArray(store.pendingBooks) ? store.pendingBooks : []).filter((b) => b.title !== title);
     saveStore(store);
     showToast(`已删除《${title}》的全部数据`, 'success');
     if (statsModal && statsModal.isOpen()) {
@@ -878,6 +925,7 @@
     const store = loadStore();
     const titles = new Set();
     store.records.forEach((r) => r.books.forEach((b) => titles.add(b.title)));
+    (Array.isArray(store.pendingBooks) ? store.pendingBooks : []).forEach((p) => titles.add(p.title));
     const list = Array.from(titles).sort((a, b) => a.localeCompare(b, 'zh'));
     const current = select.value;
     select.innerHTML = list.map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join('');
@@ -918,16 +966,20 @@
       if (el) el.innerHTML = '<div class="wawa-empty">暂无数据</div>';
     };
 
-    if (!records.length) {
+    const pendingBooks = Array.isArray(store.pendingBooks) ? store.pendingBooks : [];
+
+    if (!records.length && !pendingBooks.length) {
       summaryEl.innerHTML = statCard('提示', '还没有数据，请先采集');
       ['wawaGlobalTrend', 'wawaReaderTrend', 'wawaCumulativeTrend', 'wawaRevenueDonut', 'wawaReaderDonut', 'wawaWeekCompare', 'wawaMonthly', 'wawaEarningList', 'wawaAllBooks'].forEach(setEmpty);
       return;
     }
 
-    // 不同书可能在不同日期更新，这里汇总每本书最新的一条记录
+    // 不同书可能在不同日期更新，这里汇总每本书最新的一条真实记录。
+    // 今天/未来日期的占位快照（statDate >= 今天）不参与数据日期与“未更新”判断。
     const latestBooksMap = new Map();
     records.forEach((rec) => {
       (rec.books || []).forEach((b) => {
+        if (!b.title || isNoDataBook(b)) return;
         const existing = latestBooksMap.get(b.title);
         if (!existing || rec.date > existing._recDate) {
           latestBooksMap.set(b.title, { ...b, _recDate: rec.date });
@@ -936,7 +988,14 @@
     });
     const books = Array.from(latestBooksMap.values());
 
-    // 当前数据日期 = 各书最新记录中最大的日期。
+    // 全站书籍总览/下拉里包含暂无数据的待正式书籍；已有真实数据的同名书优先显示真实数据
+    const allBooksMap = new Map(books.map((b) => [b.title, b]));
+    pendingBooks.forEach((p) => {
+      if (!allBooksMap.has(p.title)) allBooksMap.set(p.title, { ...p, _isPending: true, _recDate: '' });
+    });
+    const allBooks = Array.from(allBooksMap.values());
+
+    // 当前数据日期 = 各真实书最新记录中最大的日期。
     // 只有更新到这一天的书才计入“今日”类汇总，避免把旧日期的增量混进来。
     const dataDate = books.reduce((max, b) => (b._recDate > max ? b._recDate : max), '');
     books.forEach((b) => { b._isFresh = b._recDate === dataDate; });
@@ -957,9 +1016,9 @@
     });
 
     summaryEl.innerHTML = [
-      statCard('数据日期', dataDate),
-      statCard('更新进度', staleCount ? `${freshBooks.length}/${books.length} 本` : '已全部更新', staleCount ? 'warn' : ''),
-      statCard('追踪书籍', String(books.length)),
+      statCard('数据日期', dataDate || '暂无正式数据'),
+      statCard('更新进度', books.length ? (staleCount ? `${freshBooks.length}/${books.length} 本` : '已全部更新') : '暂无正式数据', books.length && staleCount ? 'warn' : ''),
+      statCard('追踪书籍', String(allBooks.length)),
       statCard('记录天数', String(records.length)),
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
       statCard('今日有收益', String(earningBooks.length) + ' 本'),
@@ -968,14 +1027,16 @@
       statCard('今日新增在读', newReadersTotal == null ? '无' : (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
     ].join('');
 
-    // 只把“真实数据日期快照”画进全站趋势，过滤掉零星/伪造日期
-    const totalTrackedBooks = latestBooksMap.size;
-    const trendRecords = records.filter((r) => {
-      if (!r.books || !r.books.length) return false;
-      if (r.books.length < (totalTrackedBooks > 1 ? 2 : 1)) return false;
-      // 快照日期必须至少有一本书的 statDate 与记录日期一致
-      return r.books.some((b) => b.statDate === r.date);
-    });
+    // 只把“真实数据日期快照”画进全站趋势，过滤掉占位快照与零星/伪造日期
+    const totalTrackedBooks = books.length;
+    const trendRecords = records
+      .map((r) => ({ ...r, books: (r.books || []).filter((b) => !isNoDataBook(b)) }))
+      .filter((r) => {
+        if (!r.books.length) return false;
+        if (r.books.length < (totalTrackedBooks > 1 ? 2 : 1)) return false;
+        // 快照日期必须至少有一本书的 statDate 与记录日期一致
+        return r.books.some((b) => b.statDate === r.date);
+      });
     const trendData = trendRecords.map((r) => ({
       date: r.date,
       value: (r.books || []).reduce((s, b) => s + toNum(b.dailyRevenue), 0),
@@ -995,6 +1056,7 @@
     const cumulativeData = [];
     records.forEach((rec) => {
       (rec.books || []).forEach((b) => {
+        if (isNoDataBook(b)) return;
         if (b.totalRevenue != null) lastKnownTotal.set(b.title, toNum(b.totalRevenue));
       });
       if (trendDates.has(rec.date)) {
@@ -1022,7 +1084,7 @@
     // 今日有收益的书
     const earningEl = document.getElementById('wawaEarningList');
     if (!earningBooks.length) {
-      earningEl.innerHTML = '<div class="wawa-empty">零蛋！</div>';
+      earningEl.innerHTML = books.length ? '<div class="wawa-empty">零蛋！</div>' : '<div class="wawa-empty">暂无正式收益数据</div>';
     } else {
       earningEl.innerHTML = earningBooks.map((b) => {
         const d = bookReaderDelta(b);
@@ -1040,28 +1102,34 @@
 
     // 全部书籍总览
     const allBooksEl = document.getElementById('wawaAllBooks');
-    if (!books.length) {
+    if (!allBooks.length) {
       allBooksEl.innerHTML = '<div class="wawa-empty">暂无书籍数据</div>';
       return;
     }
     const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>总字数</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
-    const rows = books
+    const rows = allBooks
       .slice()
-      .sort((a, b) => toNum(b.totalRevenue) - toNum(a.totalRevenue) || toNum(b.readers) - toNum(a.readers))
+      .sort((a, b) => {
+        if (!!a._isPending !== !!b._isPending) return a._isPending ? 1 : -1;
+        return toNum(b.totalRevenue) - toNum(a.totalRevenue) || toNum(b.readers) - toNum(a.readers) || a.title.localeCompare(b.title, 'zh');
+      })
       .map((b) => {
-        const readerDelta = bookReaderDelta(b);
-        const dateCell = escapeHtml(b.statDate || b._recDate || '-') + (b._isFresh ? '' : ' <span class="wawa-badge-stale">未更新</span>');
+        const isPending = !!b._isPending;
+        const readerDelta = isPending ? null : bookReaderDelta(b);
+        const dateCell = isPending
+          ? '<span class="wawa-badge-stale">暂无数据</span>'
+          : escapeHtml(b.statDate || b._recDate || '-') + (b._isFresh ? '' : ' <span class="wawa-badge-stale">未更新</span>');
         return `
-      <tr class="${b._isFresh ? '' : 'wawa-row-stale'}">
+      <tr class="${isPending || !b._isFresh ? 'wawa-row-stale' : ''}">
         <td class="wawa-book-title">${escapeHtml(b.title)}</td>
         <td>${dateCell}</td>
         <td>${b.status ? `<span class="wawa-badge">${escapeHtml(b.status)}</span>` : '-'}</td>
         <td>${escapeHtml(b.wordsText || '-')}</td>
-        <td>¥${toNum(b.totalRevenue).toFixed(2)}</td>
-        <td class="${toNum(b.dailyRevenue) > 0 ? 'wawa-money' : ''}">¥${toNum(b.dailyRevenue).toFixed(2)}</td>
-        <td class="${(b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down'}">${(b.yesterdayDelta ?? 0) >= 0 ? '+' : ''}${b.yesterdayDelta ?? 0}</td>
+        <td>${isPending ? '-' : '¥' + toNum(b.totalRevenue).toFixed(2)}</td>
+        <td class="${isPending ? '' : (toNum(b.dailyRevenue) > 0 ? 'wawa-money' : '')}">${isPending ? '-' : '¥' + toNum(b.dailyRevenue).toFixed(2)}</td>
+        <td class="${isPending ? '' : ((b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : ((b.yesterdayDelta ?? 0) >= 0 ? '+' : '') + (b.yesterdayDelta ?? 0)}</td>
         <td>${b.readers == null ? '-' : b.readers + ' 人'}</td>
-        <td class="${readerDelta == null ? '' : (readerDelta >= 0 ? 'wawa-up' : 'wawa-down')}">${readerDelta == null ? '无' : (readerDelta > 0 ? '+' : '') + readerDelta}</td>
+        <td class="${readerDelta == null ? '' : (readerDelta >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : (readerDelta == null ? '无' : (readerDelta > 0 ? '+' : '') + readerDelta)}</td>
         <td>
           <button class="wawa-btn-link" data-action="view-book" data-title="${escapeHtml(b.title)}">查看</button>
           <button class="wawa-btn-link wawa-btn-danger" data-action="delete-book" data-title="${escapeHtml(b.title)}">删除</button>
@@ -1143,7 +1211,7 @@
     const seen = new Map();
     (records || []).forEach((rec) => {
       const book = (rec.books || []).find((b) => b.title === bookTitle);
-      if (!book || !book.statDate) return;
+      if (!book || !book.statDate || isNoDataBook(book)) return;
       const key = book.statDate;
       const existing = seen.get(key);
       if (!existing || rec.date > existing.recDate) {
@@ -1177,6 +1245,20 @@
     const series = bookTitle ? buildBookSeries(store.records, bookTitle) : [];
 
     if (!series.length) {
+      const pendingBook = bookTitle && (Array.isArray(store.pendingBooks) ? store.pendingBooks : []).find((p) => p.title === bookTitle);
+      if (pendingBook) {
+        if (summaryEl) {
+          summaryEl.innerHTML = [
+            statCard('最新数据日期', '暂无数据'),
+            statCard('状态', pendingBook.status || '刚签约，暂无正式数据'),
+            statCard('总字数', pendingBook.wordsText || '-'),
+          ].join('');
+        }
+        revenueChartEl.innerHTML = '<div class="wawa-empty">该书暂无正式数据，等站点更新后会自动开始记录</div>';
+        readerChartEl.innerHTML = '';
+        tableWrap.innerHTML = '';
+        return;
+      }
       if (summaryEl) summaryEl.innerHTML = '';
       revenueChartEl.innerHTML = '<div class="wawa-empty">请选择一本书查看详情</div>';
       readerChartEl.innerHTML = '<div class="wawa-empty">暂无数据</div>';
@@ -1412,6 +1494,7 @@
     if (currentView === 'global') {
       store.records.forEach((rec) => {
         (rec.books || []).forEach((book) => {
+          if (isNoDataBook(book)) return;
           rows.push([
             rec.date,
             book.title,
@@ -1449,6 +1532,11 @@
           s.delta == null ? '' : String(s.delta),
         ]);
       });
+    }
+
+    if (rows.length === 1) {
+      showToast('没有可导出的正式数据', 'warn');
+      return;
     }
 
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
