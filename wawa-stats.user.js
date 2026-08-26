@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.6.3
+// @version      0.6.4
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -1011,12 +1011,17 @@
     const totalRevenueAll = books.reduce((s, b) => s + toNum(b.totalRevenue), 0);
     const totalReaders = books.reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0);
 
-    // 今日新增在读：只统计已更新到 dataDate 的书
-    let newReadersTotal = null;
+    // 今日新增在读：只统计已更新到 dataDate 的书。
+    // 下降的在读不放进“新增在读”里互相抵消，单独记到“今日在读下降”。
+    let newReadersTotal = 0;
+    let declinedReadersTotal = 0;
+    let hasReaderDelta = false;
     freshBooks.forEach((b) => {
       const d = bookReaderDelta(b);
       if (d == null) return;
-      newReadersTotal = (newReadersTotal || 0) + d;
+      hasReaderDelta = true;
+      if (d > 0) newReadersTotal += d;
+      else if (d < 0) declinedReadersTotal += Math.abs(d);
     });
 
     summaryEl.innerHTML = [
@@ -1028,7 +1033,8 @@
       statCard('今日有收益', String(earningBooks.length) + ' 本'),
       statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
       statCard('总在读', fmtNum(totalReaders)),
-      statCard('今日新增在读', newReadersTotal == null ? '无' : (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal)),
+      statCard('今日新增在读', hasReaderDelta ? (newReadersTotal > 0 ? '+' : '') + fmtNum(newReadersTotal) : '无'),
+      statCard('今日在读下降', declinedReadersTotal > 0 ? '-' + fmtNum(declinedReadersTotal) : '0'),
     ].join('');
 
     // 只把“真实数据日期快照”画进全站趋势，过滤掉占位快照与零星/伪造日期
