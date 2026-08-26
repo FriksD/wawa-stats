@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.6.4
+// @version      0.6.5
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -118,7 +118,9 @@
   }
 
   function isNoDataBook(book) {
-    return !!book && isNoDataDate(book.statDate);
+    // 今天/未来的日期是占位；没有在读人数也视为“暂无正式数据”，
+    // 避免更新窗口前把带未来占位日期（如 8/26 的无效快照）误判成最新有效数据。
+    return !!book && (isNoDataDate(book.statDate) || book.readers == null);
   }
 
   function toNum(v) {
@@ -520,7 +522,7 @@
     const domCards = parseDomCards();
     const apiRes = await fetchRevenueApi();
     const apiItems = normalizeApiData(apiRes.data);
-    const hasTimestamp = apiItems.some((item) => item.statDate && !isNoDataDate(item.statDate));
+    const hasTimestamp = apiItems.some((item) => !isNoDataBook(item));
 
     let books = mergeData(domCards, apiItems);
 
@@ -541,7 +543,7 @@
     }
 
     // 按每本书自己的 statDate 分组入库：8-22 的书写进 8-22 的记录，绝不混日期。
-    // 今天（或未来）日期的书是刚签约、还没正式数据的占位书，不进 records，只进 pendingBooks。
+    // 今天（或未来）日期、没有在读人数的书是刚签约/还没正式数据的占位书，不进 records，只进 pendingBooks。
     const groups = new Map();
     const pendingBooks = [];
     let saved = 0;
@@ -582,7 +584,7 @@
 
     // 相对期望日期统计同步进度（只看 API 返回的正式数据书）
     const expected = expectedDataDate();
-    const validApiItems = apiItems.filter((i) => !isNoDataDate(i.statDate));
+    const validApiItems = apiItems.filter((i) => !isNoDataBook(i));
     const apiTotal = validApiItems.length;
     const freshCount = validApiItems.filter((i) => i.statDate && i.statDate >= expected).length;
 
@@ -979,7 +981,7 @@
     }
 
     // 不同书可能在不同日期更新，这里汇总每本书最新的一条真实记录。
-    // 今天/未来日期的占位快照（statDate >= 今天）不参与数据日期与“未更新”判断。
+    // 今天/未来日期、没有在读人数的占位快照都不参与数据日期与“未更新”判断。
     const latestBooksMap = new Map();
     records.forEach((rec) => {
       (rec.books || []).forEach((b) => {
