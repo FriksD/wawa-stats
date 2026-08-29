@@ -32,7 +32,18 @@ Tampermonkey 是一个浏览器扩展，用来运行这类脚本。
 
 ## 第二步：安装本脚本
 
-### 方法一：从 Greasy Fork 安装（推荐）
+### 方法一：直接安装（推荐）
+
+1. 打开链接：
+
+`https://raw.githubusercontent.com/FriksD/wawa-stats/main/wawa-stats.user.js`
+
+3. Tampermonkey 会弹出安装确认页面。
+4. 点击 **“安装”** 按钮。
+5. 安装完成。
+
+
+### 方法二：从 Greasy Fork 安装
 
 1. 打开本脚本的 Greasy Fork 页面（需要自行挂梯）。
 
@@ -42,19 +53,6 @@ Tampermonkey 是一个浏览器扩展，用来运行这类脚本。
 2. Tampermonkey 会弹出安装确认页面。
 3. 点击 **“安装”** 按钮。
 5. 安装完成。
-
-### 方法二：从本仓库安装
-
-1. 打开本仓库里的文件：
-   `wawa-stats.user.js`
-2. 点击页面右上角的 **Raw** 按钮。
-3. 浏览器可能会直接弹出 Tampermonkey 安装页面。
-4. 如果没有弹出，复制页面的完整代码。
-5. 点击 Edge/Chrome 右上角 Tampermonkey 图标 → **管理面板**。
-6. 点击 **“添加新脚本”**。
-7. 删除里面的默认代码，粘贴你复制的代码。
-8. 按 `Ctrl + S` 保存。
-9. 安装完成。
 
 ---
 
