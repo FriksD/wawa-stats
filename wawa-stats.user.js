@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.6.5
+// @version      0.7.0
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -25,6 +25,9 @@
   const STORAGE_KEY = 'wawaStats_v1';
   const STORE_VERSION = 2;
   const API_REVENUE = '/wrhp-api/api/v1/submission/novel/my_revenue';
+  const API_NOVEL_LIST = '/wrhp-api/api/v1/submission/novel/my_list';
+  const LIST_PAGE_SIZE = 20;     // 站点投稿列表的默认分页大小（与页面一致）
+  const LIST_MAX_PAGES = 50;     // 翻页保护上限
   const UPDATE_START_HOUR = 14;   // 服务器数据从 14:00 起陆续更新
   const POLL_INTERVAL_MS = 5 * 60 * 1000; // 静默轮询间隔：5 分钟
   const POLL_DEADLINE_HOUR = 17;  // 17:00 后停止轮询
@@ -163,12 +166,13 @@
       const v = GM_getValue(STORAGE_KEY, { records: [] });
       if (v && Array.isArray(v.records)) {
         v.pendingBooks = Array.isArray(v.pendingBooks) ? v.pendingBooks : [];
+        v.ignoredBooks = Array.isArray(v.ignoredBooks) ? v.ignoredBooks : [];
         return v;
       }
     } catch (e) {
       console.error('[WAWA Stats] loadStore failed', e);
     }
-    return { records: [], pendingBooks: [] };
+    return { records: [], pendingBooks: [], ignoredBooks: [] };
   }
 
   function saveStore(store) {
@@ -365,6 +369,73 @@
     }
   }
 
+// 投稿列表接口（POST 分页）：包含收益接口没有的 字数/章节/签约状态 等字段，
+// 用来补全当前页面（每页 20 本）翻页之外书籍的卡片信息。
+// 请求体：{"page":1,"page_size":20}
+async function fetchNovelListAll() {
+  const all = [];
+  try {
+    for (let page = 1; page <= LIST_MAX_PAGES; page++) {
+      const res = await fetch(API_NOVEL_LIST, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          'content-type': 'application/json',
+          'x-client-channel': 'web',
+          'x-client-platform': 'pc',
+        },
+        body: JSON.stringify({ page, page_size: LIST_PAGE_SIZE }),
+      });
+      const json = await res.json();
+      if (!json || json.code !== 200 || !json.data) {
+        throw new Error((json && json.message) || '列表接口返回异常');
+      }
+      const items = Array.isArray(json.data.items) ? json.data.items : [];
+      all.push(...items);
+      const totalPage = Number(json.data.total_page) || 1;
+      if (page >= totalPage || !items.length) break;
+    }
+  } catch (e) {
+    // 失败时保留已拉到的页，只影响缺失字段，不阻断采集
+    console.error('[WAWA Stats] fetchNovelListAll failed', e);
+  }
+  return all;
+}
+
+// 站点源码中的投稿状态枚举 → 卡片"状态"徽章文案
+const SUBMISSION_STATUS_TEXT = {
+  draft: '新建',
+  reviewing: '投稿审核中',
+  approved: '审核成功',
+  rejected: '审核失败',
+  contracting: '签约中',
+  contracted: '已签约',
+  contract_rejected: '签约失败',
+};
+
+// 列表接口真实结构（节选）：
+// { submission_id, base_novel_id, title, status, total_word_count,
+//   submitted_chapter_ids: [...], is_finished, finish_status, contract_status }
+function normalizeListItems(items) {
+  return items.map((item) => {
+    const chapterNum = Array.isArray(item.submitted_chapter_ids) ? item.submitted_chapter_ids.length : null;
+    const wordsWan = item.total_word_count != null ? toNum(item.total_word_count) / 10000 : null;
+    return {
+      submissionId: item.submission_id != null ? String(item.submission_id) : '',
+      baseNovelId: item.base_novel_id ?? null,
+      title: (item.title || '').trim(),
+      status: SUBMISSION_STATUS_TEXT[item.status] || '',
+      chapterNum,
+      chapterText: chapterNum == null ? '' : `${chapterNum}章`,
+      // 与站点卡片一致的显示格式：608236 → "60.82万字"（四舍五入两位小数）
+      wordsText: wordsWan == null ? '' : round2(wordsWan).toFixed(2) + '万字',
+      wordsWan,
+      lastUpdated: chapterNum == null ? '' : `第${chapterNum}章`,
+    };
+  });
+}
+
   // 接口真实结构：
   // { base_novel_id, title, total_revenue,
   //   latest:   { date, revenue, follow_user_cnt, available },
@@ -403,17 +474,45 @@
   }
 
   // ========== 合并 ==========
-  function mergeData(domCards, apiItems) {
+  // 用投稿列表接口的数据补全 DOM 上拿不到的字段（DOM 已有的优先，只在缺失时填）。
+  // 顺带把列表里的 submission_id / base_novel_id 回填到书上，方便后续匹配。
+  function applyListInfo(book, list) {
+    if (!book || !list) return book;
+    if (!book.submissionId && list.submissionId) book.submissionId = list.submissionId;
+    if (book.baseNovelId == null && list.baseNovelId != null) book.baseNovelId = list.baseNovelId;
+    if (!book.status && list.status) book.status = list.status;
+    if (!book.chapterText && list.chapterText) book.chapterText = list.chapterText;
+    if (book.chapterNum == null && list.chapterNum != null) book.chapterNum = list.chapterNum;
+    if (!book.wordsText && list.wordsText) book.wordsText = list.wordsText;
+    if (book.wordsWan == null && list.wordsWan != null) book.wordsWan = list.wordsWan;
+    if (!book.lastUpdated && list.lastUpdated) book.lastUpdated = list.lastUpdated;
+    return book;
+  }
+
+  function mergeData(domCards, apiItems, listItems = []) {
     const apiByTitle = new Map();
     const apiById = new Map();
     for (const a of apiItems) {
       if (a.title) apiByTitle.set(a.title, a);
       if (a.baseNovelId != null) apiById.set(String(a.baseNovelId), a);
     }
+    const listBySub = new Map();
+    const listByBase = new Map();
+    const listByTitle = new Map();
+    for (const li of listItems) {
+      if (li.submissionId) listBySub.set(li.submissionId, li);
+      if (li.baseNovelId != null) listByBase.set(String(li.baseNovelId), li);
+      if (li.title) listByTitle.set(li.title, li);
+    }
+    const findList = (book) =>
+      (book.submissionId && listBySub.get(String(book.submissionId))) ||
+      (book.baseNovelId != null && listByBase.get(String(book.baseNovelId))) ||
+      (book.title && listByTitle.get(book.title)) ||
+      null;
 
     const merged = domCards.map((card) => {
       const api = apiByTitle.get(card.title) || apiById.get(String(card.submissionId)) || null;
-      return {
+      const book = {
         ...card,
         baseNovelId: api ? api.baseNovelId : null,
         totalRevenue: card.totalRevenue ?? api?.totalRevenue ?? 0,
@@ -426,13 +525,14 @@
         statDate: api?.statDate ?? null,
         available: api ? api.available : false,
       };
+      return applyListInfo(book, findList(book));
     });
 
     // API 里有但 DOM 暂未渲染出来的书也保留
     const titles = new Set(merged.map((b) => b.title));
     for (const api of apiItems) {
       if (!titles.has(api.title)) {
-        merged.push({
+        const book = {
           submissionId: '',
           title: api.title,
           tags: [],
@@ -452,7 +552,8 @@
           previousDate: api.previousDate,
           statDate: api.statDate,
           available: api.available,
-        });
+        };
+        merged.push(applyListInfo(book, findList(book)));
         titles.add(api.title);
       }
     }
@@ -520,11 +621,12 @@
     await waitForCards(8000);
 
     const domCards = parseDomCards();
-    const apiRes = await fetchRevenueApi();
+    const [apiRes, listRaw] = await Promise.all([fetchRevenueApi(), fetchNovelListAll()]);
     const apiItems = normalizeApiData(apiRes.data);
+    const listItems = normalizeListItems(listRaw);
     const hasTimestamp = apiItems.some((item) => !isNoDataBook(item));
 
-    let books = mergeData(domCards, apiItems);
+    let books = mergeData(domCards, apiItems, listItems);
 
     // 仅手动强采且 API 没返回数据时，才点开卡片兜底补全（自动路径完全无感知）
     if (force && !hasTimestamp && books.some((b) => b.readers == null || b.dailyRevenue == null || b.totalRevenue == null)) {
@@ -768,6 +870,30 @@
     statsModal.show();
   }
 
+  // ========== 忽略名单 ==========
+  // 忽略的书仍正常计入所有统计与导出，只是在"全部书籍总览"里排到最后（按在读人数排序）
+  function getIgnoredTitles() {
+    return new Set(loadStore().ignoredBooks || []);
+  }
+
+  // 返回 true 表示现在处于忽略状态，false 表示已取消忽略
+  function toggleIgnoreBook(title) {
+    if (!title) return false;
+    const store = loadStore();
+    if (!Array.isArray(store.ignoredBooks)) store.ignoredBooks = [];
+    const idx = store.ignoredBooks.indexOf(title);
+    if (idx >= 0) {
+      store.ignoredBooks.splice(idx, 1);
+      saveStore(store);
+      showToast(`已取消忽略《${title}》`, 'success');
+      return false;
+    }
+    store.ignoredBooks.push(title);
+    saveStore(store);
+    showToast(`已忽略《${title}》，总览中排到最后`, 'success');
+    return true;
+  }
+
   function deleteBook(title) {
     if (!title) return;
     if (!confirm(`确定删除《${title}》的全部历史数据吗？\n此操作不可恢复。`)) return;
@@ -777,6 +903,7 @@
     });
     store.records = store.records.filter((rec) => (rec.books || []).length > 0);
     store.pendingBooks = (Array.isArray(store.pendingBooks) ? store.pendingBooks : []).filter((b) => b.title !== title);
+    store.ignoredBooks = (Array.isArray(store.ignoredBooks) ? store.ignoredBooks : []).filter((t) => t !== title);
     saveStore(store);
     showToast(`已删除《${title}》的全部数据`, 'success');
     if (statsModal && statsModal.isOpen()) {
@@ -851,6 +978,7 @@
           <div id="wawaBookView" class="wawa-view" style="display:none">
             <div class="wawa-toolbar">
               <select id="wawaBookSelect"></select>
+              <button id="wawaIgnoreBtn" class="wawa-btn-ghost" type="button"></button>
             </div>
             <div id="wawaBookSummary" class="wawa-summary-grid"></div>
             <div class="wawa-card">
@@ -876,6 +1004,15 @@
       tab.addEventListener('click', () => switchView(tab.dataset.view));
     });
     root.querySelector('#wawaBookSelect').addEventListener('change', renderBookView);
+    root.querySelector('#wawaIgnoreBtn').addEventListener('click', () => {
+      const title = getSelectedBook();
+      if (!title) {
+        showToast('请先选择一本书', 'warn');
+        return;
+      }
+      toggleIgnoreBook(title);
+      renderBookView();
+    });
     root.addEventListener('click', (e) => {
       const del = e.target.closest('[data-action="delete-book"]');
       if (del) {
@@ -1118,22 +1255,29 @@
       allBooksEl.innerHTML = '<div class="wawa-empty">暂无书籍数据</div>';
       return;
     }
+    // 排序分层：正常书（总收益优先）→ 已忽略的书（按在读人数）→ 暂无数据的占位书
+    const ignoredTitles = getIgnoredTitles();
+    const ignoreTier = (b) => (b._isPending ? 2 : ignoredTitles.has(b.title) ? 1 : 0);
     const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>总字数</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
     const rows = allBooks
       .slice()
       .sort((a, b) => {
-        if (!!a._isPending !== !!b._isPending) return a._isPending ? 1 : -1;
+        const ta = ignoreTier(a);
+        const tb = ignoreTier(b);
+        if (ta !== tb) return ta - tb;
+        if (ta === 1) return toNum(b.readers) - toNum(a.readers) || a.title.localeCompare(b.title, 'zh');
         return toNum(b.totalRevenue) - toNum(a.totalRevenue) || toNum(b.readers) - toNum(a.readers) || a.title.localeCompare(b.title, 'zh');
       })
       .map((b) => {
         const isPending = !!b._isPending;
+        const isIgnored = ignoredTitles.has(b.title);
         const readerDelta = isPending ? null : bookReaderDelta(b);
         const dateCell = isPending
           ? '<span class="wawa-badge-stale">暂无数据</span>'
           : escapeHtml(b.statDate || b._recDate || '-') + (b._isFresh ? '' : ' <span class="wawa-badge-stale">未更新</span>');
         return `
-      <tr class="${isPending || !b._isFresh ? 'wawa-row-stale' : ''}">
-        <td class="wawa-book-title">${escapeHtml(b.title)}</td>
+      <tr class="${isIgnored ? 'wawa-row-ignored' : isPending || !b._isFresh ? 'wawa-row-stale' : ''}">
+        <td class="wawa-book-title">${escapeHtml(b.title)}${isIgnored ? ' <span class="wawa-badge-ignored">已忽略</span>' : ''}</td>
         <td>${dateCell}</td>
         <td>${b.status ? `<span class="wawa-badge">${escapeHtml(b.status)}</span>` : '-'}</td>
         <td>${escapeHtml(b.wordsText || '-')}</td>
@@ -1245,9 +1389,21 @@
     return series;
   }
 
+  // 忽略按钮文案跟随当前选中书的忽略状态
+  function updateIgnoreButton(title) {
+    const btn = document.getElementById('wawaIgnoreBtn');
+    if (!btn) return;
+    const ignored = !!title && getIgnoredTitles().has(title);
+    btn.textContent = ignored ? '✅ 取消忽略' : '🚫 忽略此书';
+    btn.title = ignored
+      ? '取消忽略后，这本书恢复按总收益正常排序'
+      : '忽略后这本书仍计入全部统计，但在“全部书籍总览”里排到最后（按在读人数排序）';
+  }
+
   function renderBookView() {
     const store = loadStore();
     const bookTitle = getSelectedBook();
+    updateIgnoreButton(bookTitle);
     const summaryEl = document.getElementById('wawaBookSummary');
     const revenueChartEl = document.getElementById('wawaBookRevenueChart');
     const readerChartEl = document.getElementById('wawaBookReaderChart');
@@ -1806,6 +1962,10 @@
     #wawaStatsRoot .wawa-monthly-box {
       max-height: 260px;
     }
+    /* 全部书籍总览不设内滚动，跟随整个弹窗一起滚动 */
+    #wawaStatsRoot #wawaAllBooks {
+      max-height: none;
+    }
     #wawaStatsRoot .wawa-table-compact {
       min-width: 0 !important;
     }
@@ -1818,6 +1978,17 @@
       font-size: 11px;
     }
     #wawaStatsRoot .wawa-row-stale td {
+      color: #9AA1AB;
+    }
+    #wawaStatsRoot .wawa-badge-ignored {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 6px;
+      background: #F3F4F6;
+      color: #9AA1AB;
+      font-size: 11px;
+    }
+    #wawaStatsRoot .wawa-row-ignored td {
       color: #9AA1AB;
     }
     #wawaStatsRoot .wawa-stat-warn .wawa-stat-value {
@@ -1997,6 +2168,10 @@
       flex: 1;
       min-width: 220px;
       max-width: 480px;
+    }
+    #wawaStatsRoot .wawa-toolbar #wawaIgnoreBtn {
+      flex-shrink: 0;
+      white-space: nowrap;
     }
 
     #wawaStatsRoot .wawa-empty {
