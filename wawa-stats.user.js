@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.7.0
+// @version      0.8.0
 // @license     MIT
-// @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，并提供本地统计图表与 CSV 导出
+// @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，自动回填站点历史收益数据，并提供本地统计图表与 CSV 导出
 // @author       FriksD
 // @homepageURL  https://github.com/FriksD/wawa-stats
 // @supportURL   https://github.com/FriksD/wawa-stats/issues
@@ -33,6 +33,7 @@
   const POLL_DEADLINE_HOUR = 17;  // 17:00 后停止轮询
   const POLL_MAX_ATTEMPTS = 24;   // 轮询次数上限
   const AUTO_CAPTURE_DELAY = 4000; // 页面出现卡片后延迟自动采集
+  const HISTORY_FETCH_DELAY = 200; // 历史回填串行请求间隔（毫秒）
 
   // ========== 工具函数 ==========
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -167,12 +168,13 @@
       if (v && Array.isArray(v.records)) {
         v.pendingBooks = Array.isArray(v.pendingBooks) ? v.pendingBooks : [];
         v.ignoredBooks = Array.isArray(v.ignoredBooks) ? v.ignoredBooks : [];
+        v.bookMeta = (v.bookMeta && typeof v.bookMeta === 'object' && !Array.isArray(v.bookMeta)) ? v.bookMeta : {};
         return v;
       }
     } catch (e) {
       console.error('[WAWA Stats] loadStore failed', e);
     }
-    return { records: [], pendingBooks: [], ignoredBooks: [] };
+    return { records: [], pendingBooks: [], ignoredBooks: [], bookMeta: {} };
   }
 
   function saveStore(store) {
@@ -473,6 +475,220 @@ function normalizeListItems(items) {
     });
   }
 
+  // ========== 历史数据回填 ==========
+  const HISTORY_FAIL_COOLDOWN_MS = 60 * 60 * 1000; // 拉取失败后的重试冷却：一小时内不重复请求
+
+  // 站点单书历史接口（period=all）返回该书从数据首日到今天的完整每日序列，
+  // 用来：① 回填装脚本之前的空白历史；② 补上没开页面期间漏掉的日子；
+  // ③ 记录每本书的数据首日 / 首个收益日（bookMeta）。
+  // 接口真实结构：
+  // { submission_id, base_novel_id, title, period, start_date, end_date,
+  //   total_revenue, valid_revenue_days, average_daily_revenue,
+  //   valid_follow_user_days, average_follow_user_cnt,
+  //   items: [{ date, revenue, follow_user_cnt, available }] }
+  async function fetchRevenueHistory(submissionId) {
+    try {
+      const res = await fetch(`/wrhp-api/api/v1/submission/novel/${encodeURIComponent(String(submissionId))}/revenue_history?period=all`, {
+        credentials: 'include',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          'x-client-channel': 'web',
+          'x-client-platform': 'pc',
+        },
+      });
+      const json = await res.json();
+      if (!json || json.code !== 200 || !json.data || !Array.isArray(json.data.items)) {
+        throw new Error((json && json.message) || '历史接口返回异常');
+      }
+      return json.data;
+    } catch (e) {
+      console.error('[WAWA Stats] fetchRevenueHistory failed', e);
+      return null;
+    }
+  }
+
+  // 把一本书的完整历史并入本地记录：只新增缺失的日期，已有记录不动（当天实时采集的数据优先）。
+  // 每日累计总收益用 all 响应的 total_revenue 从最后一天往前倒推；昨日差/新增在读用相邻两天相减。
+  function mergeHistoryData(store, submissionId, data) {
+    const title = (data.title || '').trim();
+    const items = (data.items || [])
+      .map((it) => ({
+        date: normalizeDateValue(it.date),
+        revenue: toNum(it.revenue),
+        readers: it.follow_user_cnt == null ? null : toNum(it.follow_user_cnt),
+      }))
+      .filter((it) => it.date && it.readers != null && !isNoDataDate(it.date))
+      .sort((a, b) => a.date.localeCompare(b.date));
+    if (!title || !items.length) return { days: 0 };
+
+    let sumAfter = toNum(data.total_revenue);
+    for (let i = items.length - 1; i >= 0; i--) {
+      items[i].totalRevenue = round2(sumAfter);
+      sumAfter = round2(sumAfter - items[i].revenue);
+      items[i].yesterdayDelta = i > 0 ? round2(items[i].revenue - items[i - 1].revenue) : 0;
+      items[i].readerDelta = i > 0 && items[i - 1].readers != null ? items[i].readers - items[i - 1].readers : null;
+    }
+
+    items.forEach((it) => {
+      let rec = store.records.find((r) => r.date === it.date);
+      if (!rec) {
+        rec = {
+          date: it.date,
+          localCaptureDate: todayStr(),
+          timestampSource: 'history',
+          capturedAt: new Date().toISOString(),
+          capturedAtLocal: nowTimeStr(),
+          serverTime: '',
+          preUpdate: false,
+          historyBackfill: true,
+          books: [],
+        };
+        store.records.push(rec);
+      }
+      const book = {
+        submissionId: submissionId == null ? '' : String(submissionId),
+        title,
+        tags: [],
+        lastUpdated: '',
+        chapterText: '',
+        chapterNum: null,
+        wordsText: '',
+        wordsWan: null,
+        status: '',
+        baseNovelId: data.base_novel_id ?? null,
+        totalRevenue: it.totalRevenue,
+        dailyRevenue: it.revenue,
+        yesterdayDelta: it.yesterdayDelta,
+        readers: it.readers,
+        readerDelta: it.readerDelta,
+        previousReaders: null,
+        previousDate: null,
+        statDate: it.date,
+        available: true,
+      };
+      const idx = rec.books.findIndex((b) => b.title === title);
+      if (idx < 0) {
+        rec.books.push(book);
+      } else {
+        const ex = rec.books[idx];
+        Object.keys(book).forEach((k) => {
+          if (ex[k] == null || ex[k] === '') ex[k] = book[k]; // 只补空缺，不覆盖已采集的字段
+        });
+      }
+    });
+
+    store.records = store.records.filter((r) => (r.books || []).length > 0);
+    store.records.sort((a, b) => a.date.localeCompare(b.date));
+
+    const firstRevenue = items.find((it) => it.revenue > 0);
+    store.bookMeta = store.bookMeta || {};
+    store.bookMeta[title] = {
+      firstDataDate: normalizeDateValue(data.start_date) || items[0].date,
+      firstRevenueDate: firstRevenue ? firstRevenue.date : null,
+      historyEnd: normalizeDateValue(data.end_date) || items[items.length - 1].date,
+      syncedAt: nowTimeStr(),
+    };
+    return {
+      days: items.length,
+      firstDataDate: store.bookMeta[title].firstDataDate,
+      firstRevenueDate: store.bookMeta[title].firstRevenueDate,
+    };
+  }
+
+  // 每本书已入库的 statDate 集合（只算正式数据）
+  function recordedDatesByTitle(store) {
+    const map = new Map();
+    store.records.forEach((rec) => (rec.books || []).forEach((b) => {
+      if (!b.title || !b.statDate || isNoDataBook(b)) return;
+      if (!map.has(b.title)) map.set(b.title, new Set());
+      map.get(b.title).add(b.statDate);
+    }));
+    return map;
+  }
+
+  // 需要回填的两种情况：从未回填过；或已入库日期中间有缺口（比如几天没开页面）
+  function needsHistoryBackfill(meta, dateSet) {
+    if (!meta || !meta.historyEnd) {
+      // 从未成功回填过；上次拉取失败还在冷却期内则先跳过
+      if (meta && meta.fetchFailedAt) {
+        const t = new Date(String(meta.fetchFailedAt).replace(' ', 'T') + '+08:00').getTime();
+        if (Number.isFinite(t) && Date.now() - t < HISTORY_FAIL_COOLDOWN_MS) return false;
+      }
+      return true;
+    }
+    if (!dateSet || !dateSet.size) return false;
+    const dates = Array.from(dateSet).sort();
+    for (let i = 1; i < dates.length; i++) {
+      if (dateOffsetStr(dates[i - 1], 1) !== dates[i]) return true;
+    }
+    return false;
+  }
+
+  // 智能回填：只对“没回填过”或“记录有缺口”的书发请求，串行小延迟，平时采集零额外开销
+  async function syncBookHistories(books, options = {}) {
+    const force = !!options.force;
+    const quiet = !!options.quiet;
+    const store = loadStore();
+    store.bookMeta = store.bookMeta || {};
+    const dateMap = recordedDatesByTitle(store);
+    const seen = new Set();
+    const targets = [];
+    (books || []).forEach((b) => {
+      if (!b || !b.title || !b.submissionId || seen.has(b.title)) return;
+      if (isNoDataBook(b)) return; // 暂无正式数据的书还没有历史可拉
+      seen.add(b.title);
+      if (force || needsHistoryBackfill(store.bookMeta[b.title], dateMap.get(b.title))) {
+        targets.push({ title: b.title, subId: b.submissionId });
+      }
+    });
+    if (!targets.length) return { fetched: 0, days: 0 };
+
+    let fetched = 0;
+    let days = 0;
+    for (let i = 0; i < targets.length; i++) {
+      if (i > 0) await sleep(HISTORY_FETCH_DELAY);
+      const data = await fetchRevenueHistory(targets[i].subId);
+      if (!data) {
+        // 记录失败时间进冷却期，避免这本书每轮采集都白发一次请求
+        const failed = loadStore();
+        failed.bookMeta = failed.bookMeta || {};
+        failed.bookMeta[targets[i].title] = { ...(failed.bookMeta[targets[i].title] || {}), fetchFailedAt: nowTimeStr() };
+        saveStore(failed);
+        continue;
+      }
+      const cur = loadStore(); // 每本单独落盘，中途失败不丢已完成的部分
+      cur.bookMeta = cur.bookMeta || {};
+      const res = mergeHistoryData(cur, targets[i].subId, data);
+      if (res.days) {
+        saveStore(cur);
+        fetched++;
+        days += res.days;
+        console.log(`[WAWA Stats] 已回填《${targets[i].title}》${res.days} 天历史（${res.firstDataDate} 起${res.firstRevenueDate ? '，首个收益日 ' + res.firstRevenueDate : '，暂无收益'}）`);
+      }
+    }
+
+    if (quiet) {
+      console.log(`[WAWA Stats] 历史回填完成：${fetched} 本书 / ${days} 天`);
+    } else if (fetched) {
+      showToast(`✅ 历史回填完成：${fetched} 本书 / ${days} 天`, 'success');
+    } else {
+      showToast('没有可回填的书籍（缺投稿 ID 或暂无数据）', 'warn');
+    }
+    return { fetched, days };
+  }
+
+  // 手动回填用：从本地记录里取每本书最新一条（含 submissionId）
+  function latestBooksFromStore() {
+    const store = loadStore();
+    const latest = new Map();
+    store.records.forEach((rec) => (rec.books || []).forEach((b) => {
+      if (!b.title) return;
+      const ex = latest.get(b.title);
+      if (!ex || rec.date > ex._recDate) latest.set(b.title, { ...b, _recDate: rec.date });
+    }));
+    return Array.from(latest.values());
+  }
+
   // ========== 合并 ==========
   // 用投稿列表接口的数据补全 DOM 上拿不到的字段（DOM 已有的优先，只在缺失时填）。
   // 顺带把列表里的 submission_id / base_novel_id 回填到书上，方便后续匹配。
@@ -682,6 +898,13 @@ function normalizeListItems(items) {
         serverTime: apiRes.serverTime,
         preUpdate: !isAfterUpdateStart(),
       });
+    }
+
+    // 智能回填：新书 / 记录有缺口的书静默补历史（串行少量请求，平时零额外开销）
+    try {
+      await syncBookHistories(books, { quiet: true });
+    } catch (e) {
+      console.error('[WAWA Stats] 历史回填失败', e);
     }
 
     // 相对期望日期统计同步进度（只看 API 返回的正式数据书）
@@ -904,6 +1127,7 @@ function normalizeListItems(items) {
     store.records = store.records.filter((rec) => (rec.books || []).length > 0);
     store.pendingBooks = (Array.isArray(store.pendingBooks) ? store.pendingBooks : []).filter((b) => b.title !== title);
     store.ignoredBooks = (Array.isArray(store.ignoredBooks) ? store.ignoredBooks : []).filter((t) => t !== title);
+    if (store.bookMeta) delete store.bookMeta[title]; // 元数据一并清掉，重新采集时会重新回填
     saveStore(store);
     showToast(`已删除《${title}》的全部数据`, 'success');
     if (statsModal && statsModal.isOpen()) {
@@ -1167,7 +1391,6 @@ function normalizeListItems(items) {
       statCard('数据日期', dataDate || '暂无正式数据'),
       statCard('更新进度', books.length ? (staleCount ? `${freshBooks.length}/${books.length} 本` : '已全部更新') : '暂无正式数据', books.length && staleCount ? 'warn' : ''),
       statCard('追踪书籍', String(allBooks.length)),
-      statCard('记录天数', String(records.length)),
       statCard('今日总收益', '¥' + totalDaily.toFixed(2)),
       statCard('今日有收益', String(earningBooks.length) + ' 本'),
       statCard('所有书总收益', '¥' + totalRevenueAll.toFixed(2)),
@@ -1258,7 +1481,7 @@ function normalizeListItems(items) {
     // 排序分层：正常书（总收益优先）→ 已忽略的书（按在读人数）→ 暂无数据的占位书
     const ignoredTitles = getIgnoredTitles();
     const ignoreTier = (b) => (b._isPending ? 2 : ignoredTitles.has(b.title) ? 1 : 0);
-    const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>总字数</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
+    const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>首个收益日</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
     const rows = allBooks
       .slice()
       .sort((a, b) => {
@@ -1275,12 +1498,18 @@ function normalizeListItems(items) {
         const dateCell = isPending
           ? '<span class="wawa-badge-stale">暂无数据</span>'
           : escapeHtml(b.statDate || b._recDate || '-') + (b._isFresh ? '' : ' <span class="wawa-badge-stale">未更新</span>');
+        const meta = (store.bookMeta || {})[b.title] || null;
+        const firstRevCell = meta && meta.firstRevenueDate
+          ? escapeHtml(meta.firstRevenueDate)
+          : meta && meta.firstDataDate
+            ? '<span class="wawa-dim">暂无收益</span>'
+            : '-';
         return `
       <tr class="${isIgnored ? 'wawa-row-ignored' : isPending || !b._isFresh ? 'wawa-row-stale' : ''}">
         <td class="wawa-book-title">${escapeHtml(b.title)}${isIgnored ? ' <span class="wawa-badge-ignored">已忽略</span>' : ''}</td>
         <td>${dateCell}</td>
         <td>${b.status ? `<span class="wawa-badge">${escapeHtml(b.status)}</span>` : '-'}</td>
-        <td>${escapeHtml(b.wordsText || '-')}</td>
+        <td>${firstRevCell}</td>
         <td>${isPending ? '-' : '¥' + toNum(b.totalRevenue).toFixed(2)}</td>
         <td class="${isPending ? '' : (toNum(b.dailyRevenue) > 0 ? 'wawa-money' : '')}">${isPending ? '-' : '¥' + toNum(b.dailyRevenue).toFixed(2)}</td>
         <td class="${isPending ? '' : ((b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : ((round2(b.yesterdayDelta ?? 0) >= 0 ? '+' : '') + round2(b.yesterdayDelta ?? 0))}</td>
@@ -1436,13 +1665,15 @@ function normalizeListItems(items) {
 
     const latest = series[series.length - 1];
     if (summaryEl) {
+      const meta = (store.bookMeta || {})[bookTitle] || null;
       summaryEl.innerHTML = [
         statCard('最新数据日期', latest.date),
         statCard('累计总收益', '¥' + toNum(latest.book.totalRevenue).toFixed(2)),
         statCard('最新单日收益', '¥' + toNum(latest.book.dailyRevenue).toFixed(2)),
         statCard('在读人数', latest.book.readers == null ? '-' : fmtNum(toNum(latest.book.readers))),
         statCard('最新新增在读', latest.delta == null ? '无' : (latest.delta > 0 ? '+' : '') + fmtNum(latest.delta)),
-        statCard('已记录天数', String(series.length)),
+        statCard('数据首日', meta ? meta.firstDataDate : '-'),
+        statCard('首个收益日', meta ? (meta.firstRevenueDate || '暂无收益') : '-'),
       ].join('');
     }
 
@@ -2182,6 +2413,7 @@ function normalizeListItems(items) {
     }
     #wawaStatsRoot .wawa-up { color: #0F9D58; }
     #wawaStatsRoot .wawa-down { color: #F53F3F; }
+    #wawaStatsRoot .wawa-dim { color: #9AA1AB; font-size: 12px; }
   `);
 
   // ========== 初始化 ==========
@@ -2191,6 +2423,10 @@ function normalizeListItems(items) {
     observeCards();
     try {
       GM_registerMenuCommand('📥 立即采集今日数据', () => captureNow({ force: true }));
+      GM_registerMenuCommand('⏪ 回填全部历史数据', async () => {
+        const r = await syncBookHistories(latestBooksFromStore(), { force: true });
+        if (r.fetched && statsModal && statsModal.isOpen()) statsModal.refresh();
+      });
       GM_registerMenuCommand('📊 打开数据统计', openStatsModal);
     } catch (e) {
       // 某些环境不支持菜单命令，忽略
