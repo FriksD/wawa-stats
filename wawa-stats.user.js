@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.8.0
+// @version      0.8.1
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，自动回填站点历史收益数据，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -480,7 +480,7 @@ function normalizeListItems(items) {
 
   // 站点单书历史接口（period=all）返回该书从数据首日到今天的完整每日序列，
   // 用来：① 回填装脚本之前的空白历史；② 补上没开页面期间漏掉的日子；
-  // ③ 记录每本书的数据首日 / 首个收益日（bookMeta）。
+  // ③ 记录每本书的首个数据日（bookMeta）。
   // 接口真实结构：
   // { submission_id, base_novel_id, title, period, start_date, end_date,
   //   total_revenue, valid_revenue_days, average_daily_revenue,
@@ -580,18 +580,16 @@ function normalizeListItems(items) {
     store.records = store.records.filter((r) => (r.books || []).length > 0);
     store.records.sort((a, b) => a.date.localeCompare(b.date));
 
-    const firstRevenue = items.find((it) => it.revenue > 0);
+    // 首个数据日 = 第一天有在读人数数据的日期（items 已过滤并按日期升序）
     store.bookMeta = store.bookMeta || {};
     store.bookMeta[title] = {
-      firstDataDate: normalizeDateValue(data.start_date) || items[0].date,
-      firstRevenueDate: firstRevenue ? firstRevenue.date : null,
+      firstDataDate: items[0].date,
       historyEnd: normalizeDateValue(data.end_date) || items[items.length - 1].date,
       syncedAt: nowTimeStr(),
     };
     return {
       days: items.length,
       firstDataDate: store.bookMeta[title].firstDataDate,
-      firstRevenueDate: store.bookMeta[title].firstRevenueDate,
     };
   }
 
@@ -663,7 +661,7 @@ function normalizeListItems(items) {
         saveStore(cur);
         fetched++;
         days += res.days;
-        console.log(`[WAWA Stats] 已回填《${targets[i].title}》${res.days} 天历史（${res.firstDataDate} 起${res.firstRevenueDate ? '，首个收益日 ' + res.firstRevenueDate : '，暂无收益'}）`);
+        console.log(`[WAWA Stats] 已回填《${targets[i].title}》${res.days} 天历史（${res.firstDataDate} 起）`);
       }
     }
 
@@ -1085,6 +1083,16 @@ function normalizeListItems(items) {
   // ========== UI：统计弹窗 ==========
   let statsModal = null;
   let currentView = 'global';
+  let chartRange = 0; // 折线图时间尺度：0=全部，7/14/30/90=近 N 天
+
+  // 按最后一个数据点的日期往前截取近 N 天（0 = 全部）；窗口内一个点都没有时至少保留最后一个点
+  function applyChartRange(data) {
+    if (!chartRange || !data.length) return data;
+    const minDate = dateOffsetStr(data[data.length - 1].date, -(chartRange - 1));
+    if (!minDate) return data;
+    const sliced = data.filter((d) => d.date >= minDate);
+    return sliced.length ? sliced : data.slice(-1);
+  }
 
   function openStatsModal() {
     if (!statsModal) {
@@ -1157,6 +1165,16 @@ function normalizeListItems(items) {
           <button class="wawa-tab active" data-view="global">全局概览</button>
           <button class="wawa-tab" data-view="book">单书详情</button>
         </div>
+        <div class="wawa-range-bar">
+          <span class="wawa-range-label">📈 折线图时间尺度</span>
+          <div class="wawa-range-tabs">
+            <button class="wawa-range-btn active" data-range="0" type="button">全部</button>
+            <button class="wawa-range-btn" data-range="7" type="button">近7天</button>
+            <button class="wawa-range-btn" data-range="14" type="button">近14天</button>
+            <button class="wawa-range-btn" data-range="30" type="button">近30天</button>
+            <button class="wawa-range-btn" data-range="90" type="button">近90天</button>
+          </div>
+        </div>
         <div class="wawa-modal-body">
           <div id="wawaGlobalView" class="wawa-view">
             <div id="wawaSummary" class="wawa-summary-grid"></div>
@@ -1226,6 +1244,13 @@ function normalizeListItems(items) {
 
     root.querySelectorAll('.wawa-tab').forEach((tab) => {
       tab.addEventListener('click', () => switchView(tab.dataset.view));
+    });
+    root.querySelectorAll('.wawa-range-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        chartRange = Number(btn.dataset.range) || 0;
+        root.querySelectorAll('.wawa-range-btn').forEach((b) => b.classList.toggle('active', b === btn));
+        renderStats();
+      });
     });
     root.querySelector('#wawaBookSelect').addEventListener('change', renderBookView);
     root.querySelector('#wawaIgnoreBtn').addEventListener('click', () => {
@@ -1413,13 +1438,13 @@ function normalizeListItems(items) {
       date: r.date,
       value: (r.books || []).reduce((s, b) => s + toNum(b.dailyRevenue), 0),
     }));
-    drawLineChart(document.getElementById('wawaGlobalTrend'), trendData, '全站单日收益（元）');
+    drawLineChart(document.getElementById('wawaGlobalTrend'), applyChartRange(trendData), '全站单日收益（元）');
 
     const readerTrendData = trendRecords.map((r) => ({
       date: r.date,
       value: (r.books || []).reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0),
     }));
-    drawLineChart(document.getElementById('wawaReaderTrend'), readerTrendData, '全站在读人数（人）');
+    drawLineChart(document.getElementById('wawaReaderTrend'), applyChartRange(readerTrendData), '全站在读人数（人）');
 
     // 累计总收益趋势：每个日期对每本书取“当日或之前最近一次”的 totalRevenue（carry-forward），
     // 避免某本书某天缺记录导致曲线下凹
@@ -1437,7 +1462,7 @@ function normalizeListItems(items) {
         cumulativeData.push({ date: rec.date, value: Math.round(sum * 100) / 100 });
       }
     });
-    drawLineChart(document.getElementById('wawaCumulativeTrend'), cumulativeData, '全站累计总收益（元）');
+    drawLineChart(document.getElementById('wawaCumulativeTrend'), applyChartRange(cumulativeData), '全站累计总收益（元）');
 
     renderWeekCompare(document.getElementById('wawaWeekCompare'), trendRecords);
     renderMonthlyStats(document.getElementById('wawaMonthly'), trendRecords);
@@ -1481,7 +1506,7 @@ function normalizeListItems(items) {
     // 排序分层：正常书（总收益优先）→ 已忽略的书（按在读人数）→ 暂无数据的占位书
     const ignoredTitles = getIgnoredTitles();
     const ignoreTier = (b) => (b._isPending ? 2 : ignoredTitles.has(b.title) ? 1 : 0);
-    const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>首个收益日</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
+    const head = '<tr><th>书名</th><th>数据日期</th><th>状态</th><th>首个数据日</th><th>总收益</th><th>今日收益</th><th>昨日</th><th>在读</th><th>新增在读</th><th></th></tr>';
     const rows = allBooks
       .slice()
       .sort((a, b) => {
@@ -1499,17 +1524,13 @@ function normalizeListItems(items) {
           ? '<span class="wawa-badge-stale">暂无数据</span>'
           : escapeHtml(b.statDate || b._recDate || '-') + (b._isFresh ? '' : ' <span class="wawa-badge-stale">未更新</span>');
         const meta = (store.bookMeta || {})[b.title] || null;
-        const firstRevCell = meta && meta.firstRevenueDate
-          ? escapeHtml(meta.firstRevenueDate)
-          : meta && meta.firstDataDate
-            ? '<span class="wawa-dim">暂无收益</span>'
-            : '-';
+        const firstDataCell = meta && meta.firstDataDate ? escapeHtml(meta.firstDataDate) : '-';
         return `
       <tr class="${isIgnored ? 'wawa-row-ignored' : isPending || !b._isFresh ? 'wawa-row-stale' : ''}">
         <td class="wawa-book-title">${escapeHtml(b.title)}${isIgnored ? ' <span class="wawa-badge-ignored">已忽略</span>' : ''}</td>
         <td>${dateCell}</td>
         <td>${b.status ? `<span class="wawa-badge">${escapeHtml(b.status)}</span>` : '-'}</td>
-        <td>${firstRevCell}</td>
+        <td>${firstDataCell}</td>
         <td>${isPending ? '-' : '¥' + toNum(b.totalRevenue).toFixed(2)}</td>
         <td class="${isPending ? '' : (toNum(b.dailyRevenue) > 0 ? 'wawa-money' : '')}">${isPending ? '-' : '¥' + toNum(b.dailyRevenue).toFixed(2)}</td>
         <td class="${isPending ? '' : ((b.yesterdayDelta || 0) >= 0 ? 'wawa-up' : 'wawa-down')}">${isPending ? '-' : ((round2(b.yesterdayDelta ?? 0) >= 0 ? '+' : '') + round2(b.yesterdayDelta ?? 0))}</td>
@@ -1672,19 +1693,18 @@ function normalizeListItems(items) {
         statCard('最新单日收益', '¥' + toNum(latest.book.dailyRevenue).toFixed(2)),
         statCard('在读人数', latest.book.readers == null ? '-' : fmtNum(toNum(latest.book.readers))),
         statCard('最新新增在读', latest.delta == null ? '无' : (latest.delta > 0 ? '+' : '') + fmtNum(latest.delta)),
-        statCard('数据首日', meta ? meta.firstDataDate : '-'),
-        statCard('首个收益日', meta ? (meta.firstRevenueDate || '暂无收益') : '-'),
+        statCard('首个数据日', meta ? meta.firstDataDate : '-'),
       ].join('');
     }
 
     drawLineChart(
       revenueChartEl,
-      series.map((s) => ({ date: s.date, value: toNum(s.book.dailyRevenue) })),
+      applyChartRange(series.map((s) => ({ date: s.date, value: toNum(s.book.dailyRevenue) }))),
       '单日收益（元）'
     );
     drawLineChart(
       readerChartEl,
-      series.map((s) => ({ date: s.date, value: s.book.readers == null ? null : toNum(s.book.readers) })),
+      applyChartRange(series.map((s) => ({ date: s.date, value: s.book.readers == null ? null : toNum(s.book.readers) }))),
       '在读人数（人）'
     );
 
@@ -2067,6 +2087,45 @@ function normalizeListItems(items) {
       font-weight: 600;
     }
 
+    #wawaStatsRoot .wawa-range-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 24px 12px;
+      background: #fff;
+      border-bottom: 1px solid #EDF0F3;
+    }
+    #wawaStatsRoot .wawa-range-label {
+      font-size: 12px;
+      color: #9AA1AB;
+      white-space: nowrap;
+    }
+    #wawaStatsRoot .wawa-range-tabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    #wawaStatsRoot .wawa-range-btn {
+      padding: 5px 12px;
+      border: 1px solid #E5E7EB;
+      border-radius: 8px;
+      background: #fff;
+      color: #6B7280;
+      font-size: 12px;
+      cursor: pointer;
+      transition: color .15s, border-color .15s, background .15s;
+    }
+    #wawaStatsRoot .wawa-range-btn:hover {
+      border-color: #0F9D58;
+      color: #0F9D58;
+    }
+    #wawaStatsRoot .wawa-range-btn.active {
+      background: #EAF7EF;
+      border-color: #0F9D58;
+      color: #0F9D58;
+      font-weight: 600;
+    }
+
     #wawaStatsRoot .wawa-modal-body {
       padding: 20px 24px 28px;
       overflow: auto;
@@ -2413,7 +2472,6 @@ function normalizeListItems(items) {
     }
     #wawaStatsRoot .wawa-up { color: #0F9D58; }
     #wawaStatsRoot .wawa-down { color: #F53F3F; }
-    #wawaStatsRoot .wawa-dim { color: #9AA1AB; font-size: 12px; }
   `);
 
   // ========== 初始化 ==========
