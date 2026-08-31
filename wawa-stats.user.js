@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WAWA 小说数据记录与统计
 // @namespace    local.wawa-stats
-// @version      0.8.1
+// @version      0.8.2
 // @license     MIT
 // @description  记录 wawawriter.com 投稿页每日字数/章节/收益/在读人数，自动回填站点历史收益数据，并提供本地统计图表与 CSV 导出
 // @author       FriksD
@@ -477,6 +477,11 @@ function normalizeListItems(items) {
 
   // ========== 历史数据回填 ==========
   const HISTORY_FAIL_COOLDOWN_MS = 60 * 60 * 1000; // 拉取失败后的重试冷却：一小时内不重复请求
+  // 回填覆盖本地已有记录的字段：收益/在读相关以站点历史为准（本地早期采集可能错位）
+  const HISTORY_OVERWRITE_FIELDS = new Set([
+    'submissionId', 'baseNovelId', 'totalRevenue', 'dailyRevenue', 'yesterdayDelta',
+    'readers', 'readerDelta', 'statDate', 'available',
+  ]);
 
   // 站点单书历史接口（period=all）返回该书从数据首日到今天的完整每日序列，
   // 用来：① 回填装脚本之前的空白历史；② 补上没开页面期间漏掉的日子；
@@ -507,7 +512,8 @@ function normalizeListItems(items) {
     }
   }
 
-  // 把一本书的完整历史并入本地记录：只新增缺失的日期，已有记录不动（当天实时采集的数据优先）。
+  // 把一本书的完整历史并入本地记录：只新增缺失的日期；已有记录中收益/在读相关字段以站点历史为准
+  // 覆盖（本地早期采集可能错位，比如把 8-18 的数据写到了 8-17），字数/章节/状态等历史接口没有的字段保留本地值。
   // 每日累计总收益用 all 响应的 total_revenue 从最后一天往前倒推；昨日差/新增在读用相邻两天相减。
   function mergeHistoryData(store, submissionId, data) {
     const title = (data.title || '').trim();
@@ -570,9 +576,11 @@ function normalizeListItems(items) {
       if (idx < 0) {
         rec.books.push(book);
       } else {
+        // 收益/在读字段以站点历史为准覆盖本地；字数/章节/状态等历史接口没有的字段只补空缺
         const ex = rec.books[idx];
         Object.keys(book).forEach((k) => {
-          if (ex[k] == null || ex[k] === '') ex[k] = book[k]; // 只补空缺，不覆盖已采集的字段
+          if (HISTORY_OVERWRITE_FIELDS.has(k)) ex[k] = book[k];
+          else if (ex[k] == null || ex[k] === '') ex[k] = book[k];
         });
       }
     });
@@ -581,11 +589,13 @@ function normalizeListItems(items) {
     store.records.sort((a, b) => a.date.localeCompare(b.date));
 
     // 首个数据日 = 第一天有在读人数数据的日期（items 已过滤并按日期升序）
+    // v2：0.8.2 起收益/在读以历史为准覆盖本地，老数据需要重同步一次才会带上该标记
     store.bookMeta = store.bookMeta || {};
     store.bookMeta[title] = {
       firstDataDate: items[0].date,
       historyEnd: normalizeDateValue(data.end_date) || items[items.length - 1].date,
       syncedAt: nowTimeStr(),
+      v2: true,
     };
     return {
       days: items.length,
@@ -604,10 +614,10 @@ function normalizeListItems(items) {
     return map;
   }
 
-  // 需要回填的两种情况：从未回填过；或已入库日期中间有缺口（比如几天没开页面）
+  // 需要回填的三种情况：从未回填过、旧版回填（无 v2 标记，需以新逻辑重同步一次）、已入库日期中间有缺口
   function needsHistoryBackfill(meta, dateSet) {
-    if (!meta || !meta.historyEnd) {
-      // 从未成功回填过；上次拉取失败还在冷却期内则先跳过
+    if (!meta || !meta.historyEnd || !meta.v2) {
+      // 从未成功回填过，或旧版已回填但还没用 v2 新逻辑覆盖过（收益/在读以历史为准）；上次拉取失败还在冷却期内则先跳过
       if (meta && meta.fetchFailedAt) {
         const t = new Date(String(meta.fetchFailedAt).replace(' ', 'T') + '+08:00').getTime();
         if (Number.isFinite(t) && Date.now() - t < HISTORY_FAIL_COOLDOWN_MS) return false;
@@ -1347,6 +1357,52 @@ function normalizeListItems(items) {
     return null;
   }
 
+  // ========== 统一统计口径 ==========
+  // 所有统计（汇总卡片、趋势图、环比、月度、饼图、总览表、CSV）都从下面三个公共视图派生，
+  // 不再各算一套：globalDailySeries 是“全站单日收益/在读/新增在读”的唯一来源，
+  // 趋势图/环比/月度只是它的切片。配合历史回填（累计总收益与单日收益同源），
+  // 任何日期范围的单日收益之和恒等于最新累计总收益之和，不会出现月度收益 > 总收益这类矛盾。
+
+  // 每本书最新一条有效记录（用于汇总卡片、总览表、饼图、今日类统计）
+  function latestBookByTitle(records) {
+    const map = new Map();
+    (records || []).forEach((rec) => {
+      (rec.books || []).forEach((b) => {
+        if (!b.title || isNoDataBook(b)) return;
+        const existing = map.get(b.title);
+        if (!existing || rec.date > existing._recDate) {
+          map.set(b.title, { ...b, _recDate: rec.date });
+        }
+      });
+    });
+    return map;
+  }
+
+  // 全站每日汇总：把每一天快照里所有有效书的收益/在读/新增在读加总。
+  // 快照里至少有一本书的 statDate 与记录日期一致才算有效日（过滤零星/伪造日期）。
+  function globalDailySeries(records) {
+    return (records || [])
+      .map((r) => {
+        const validBooks = (r.books || []).filter((b) => !isNoDataBook(b));
+        return { rec: r, books: validBooks };
+      })
+      .filter(({ rec, books }) => books.length && books.some((b) => b.statDate === rec.date))
+      .map(({ rec, books }) => ({
+        date: rec.date,
+        revenue: books.reduce((s, b) => s + toNum(b.dailyRevenue), 0),
+        readers: books.reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0),
+        readerDelta: books.reduce((s, b) => {
+          const d = bookReaderDelta(b);
+          return s + (d == null ? 0 : d);
+        }, 0),
+        bookCount: books.length,
+      }));
+  }
+
+  // 区间求和工具（环比 / 月度统计共用）
+  const sumDailyRevenue = (series) => series.reduce((s, d) => s + d.revenue, 0);
+  const sumDailyReaderDelta = (series) => series.reduce((s, d) => s + d.readerDelta, 0);
+
   function renderGlobalView() {
     const store = loadStore();
     const records = store.records || [];
@@ -1368,17 +1424,7 @@ function normalizeListItems(items) {
 
     // 不同书可能在不同日期更新，这里汇总每本书最新的一条真实记录。
     // 今天/未来日期、没有在读人数的占位快照都不参与数据日期与“未更新”判断。
-    const latestBooksMap = new Map();
-    records.forEach((rec) => {
-      (rec.books || []).forEach((b) => {
-        if (!b.title || isNoDataBook(b)) return;
-        const existing = latestBooksMap.get(b.title);
-        if (!existing || rec.date > existing._recDate) {
-          latestBooksMap.set(b.title, { ...b, _recDate: rec.date });
-        }
-      });
-    });
-    const books = Array.from(latestBooksMap.values());
+    const books = Array.from(latestBookByTitle(records).values());
 
     // 全站书籍总览/下拉里包含暂无数据的待正式书籍；已有真实数据的同名书优先显示真实数据
     const allBooksMap = new Map(books.map((b) => [b.title, b]));
@@ -1424,31 +1470,18 @@ function normalizeListItems(items) {
       statCard('今日在读下降', declinedReadersTotal > 0 ? '-' + fmtNum(declinedReadersTotal) : '0'),
     ].join('');
 
-    // 只把“真实数据日期快照”画进全站趋势，过滤掉占位快照与零星/伪造日期
-    const totalTrackedBooks = books.length;
-    const trendRecords = records
-      .map((r) => ({ ...r, books: (r.books || []).filter((b) => !isNoDataBook(b)) }))
-      .filter((r) => {
-        if (!r.books.length) return false;
-        if (r.books.length < (totalTrackedBooks > 1 ? 2 : 1)) return false;
-        // 快照日期必须至少有一本书的 statDate 与记录日期一致
-        return r.books.some((b) => b.statDate === r.date);
-      });
-    const trendData = trendRecords.map((r) => ({
-      date: r.date,
-      value: (r.books || []).reduce((s, b) => s + toNum(b.dailyRevenue), 0),
-    }));
+    // 全站趋势/环比/月度统计共用同一份每日汇总视图（统一口径，见 globalDailySeries）
+    const series = globalDailySeries(records);
+
+    const trendData = series.map((d) => ({ date: d.date, value: d.revenue }));
     drawLineChart(document.getElementById('wawaGlobalTrend'), applyChartRange(trendData), '全站单日收益（元）');
 
-    const readerTrendData = trendRecords.map((r) => ({
-      date: r.date,
-      value: (r.books || []).reduce((s, b) => s + (b.readers == null ? 0 : toNum(b.readers)), 0),
-    }));
+    const readerTrendData = series.map((d) => ({ date: d.date, value: d.readers }));
     drawLineChart(document.getElementById('wawaReaderTrend'), applyChartRange(readerTrendData), '全站在读人数（人）');
 
     // 累计总收益趋势：每个日期对每本书取“当日或之前最近一次”的 totalRevenue（carry-forward），
-    // 避免某本书某天缺记录导致曲线下凹
-    const trendDates = new Set(trendRecords.map((r) => r.date));
+    // 避免某本书某天缺记录导致曲线下凹；日期轴与上面的每日汇总视图保持一致
+    const trendDates = new Set(series.map((d) => d.date));
     const lastKnownTotal = new Map();
     const cumulativeData = [];
     records.forEach((rec) => {
@@ -1464,8 +1497,8 @@ function normalizeListItems(items) {
     });
     drawLineChart(document.getElementById('wawaCumulativeTrend'), applyChartRange(cumulativeData), '全站累计总收益（元）');
 
-    renderWeekCompare(document.getElementById('wawaWeekCompare'), trendRecords);
-    renderMonthlyStats(document.getElementById('wawaMonthly'), trendRecords);
+    renderWeekCompare(document.getElementById('wawaWeekCompare'), series);
+    renderMonthlyStats(document.getElementById('wawaMonthly'), series);
 
     const revenueItems = earningBooks
       .map((b) => ({ label: b.title, value: toNum(b.dailyRevenue) }))
@@ -1546,24 +1579,18 @@ function normalizeListItems(items) {
     allBooksEl.innerHTML = `<table><thead>${head}</thead><tbody>${rows}</tbody></table>`;
   }
 
-  // 近7日 vs 前7日：收益与新增在读的环比对比
-  function renderWeekCompare(container, trendRecords) {
+  // 近7日 vs 前7日：收益与新增在读的环比对比（series 为统一的全站每日汇总视图）
+  function renderWeekCompare(container, series) {
     if (!container) return;
-    if (!trendRecords.length) {
+    if (!series.length) {
       container.innerHTML = '<div class="wawa-empty">暂无数据</div>';
       return;
     }
-    const recent = trendRecords.slice(-7);
-    const prev = trendRecords.slice(-14, -7);
-    const sumRevenue = (recs) => recs.reduce((s, r) => s + (r.books || []).reduce((x, b) => x + toNum(b.dailyRevenue), 0), 0);
-    const sumReaderDelta = (recs) => recs.reduce((s, r) => s + (r.books || []).reduce((x, b) => {
-      const d = bookReaderDelta(b);
-      return x + (d == null ? 0 : d);
-    }, 0), 0);
-
+    const recent = series.slice(-7);
+    const prev = series.slice(-14, -7);
     const blocks = [
-      { label: '收益', cur: sumRevenue(recent), pre: prev.length ? sumRevenue(prev) : null, fmt: (v) => '¥' + v.toFixed(2) },
-      { label: '新增在读', cur: sumReaderDelta(recent), pre: prev.length ? sumReaderDelta(prev) : null, fmt: (v) => fmtNum(v) + ' 人' },
+      { label: '收益', cur: sumDailyRevenue(recent), pre: prev.length ? sumDailyRevenue(prev) : null, fmt: (v) => '¥' + v.toFixed(2) },
+      { label: '新增在读', cur: sumDailyReaderDelta(recent), pre: prev.length ? sumDailyReaderDelta(prev) : null, fmt: (v) => fmtNum(v) + ' 人' },
     ];
     container.innerHTML = blocks.map((blk) => {
       let compareHtml = '<span class="wawa-compare-na">前7日数据不足，暂无对比</span>';
@@ -1582,24 +1609,21 @@ function normalizeListItems(items) {
     }).join('');
   }
 
-  // 月度统计：按月份汇总每日收益与新增在读（例如查看 7 月总收益）
-  function renderMonthlyStats(container, trendRecords) {
+  // 月度统计：按月份汇总每日收益与新增在读（series 为统一的全站每日汇总视图）
+  function renderMonthlyStats(container, series) {
     if (!container) return;
-    if (!trendRecords.length) {
+    if (!series.length) {
       container.innerHTML = '<div class="wawa-empty">暂无数据</div>';
       return;
     }
     const byMonth = new Map(); // '2026-07' -> { days, revenue, readerDelta }
-    trendRecords.forEach((r) => {
-      const month = r.date.slice(0, 7);
+    series.forEach((d) => {
+      const month = d.date.slice(0, 7);
       if (!byMonth.has(month)) byMonth.set(month, { days: 0, revenue: 0, readerDelta: 0 });
       const m = byMonth.get(month);
       m.days++;
-      (r.books || []).forEach((b) => {
-        m.revenue += toNum(b.dailyRevenue);
-        const d = bookReaderDelta(b);
-        if (d != null) m.readerDelta += d;
-      });
+      m.revenue += d.revenue;
+      m.readerDelta += d.readerDelta;
     });
     const months = Array.from(byMonth.entries()).sort((a, b) => b[0].localeCompare(a[0])); // 最新月份在前
     const head = '<tr><th>月份</th><th>收益</th><th>新增在读</th><th>记录</th></tr>';
@@ -1612,8 +1636,8 @@ function normalizeListItems(items) {
     container.innerHTML = `<table class="wawa-table-compact"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
   }
 
-  // 构建单书按 statDate 去重后的时间序列（renderBookView / exportCsv 共用）
-  function buildBookSeries(records, bookTitle) {
+  // 单书按 statDate 去重后的每日序列（renderBookView / exportCsv 共用），与 globalDailySeries 同构
+  function bookDailySeries(records, bookTitle) {
     const seen = new Map();
     (records || []).forEach((rec) => {
       const book = (rec.books || []).find((b) => b.title === bookTitle);
@@ -1660,7 +1684,7 @@ function normalizeListItems(items) {
     const tableWrap = document.getElementById('wawaTableWrap');
     if (!revenueChartEl || !readerChartEl || !tableWrap) return;
 
-    const series = bookTitle ? buildBookSeries(store.records, bookTitle) : [];
+    const series = bookTitle ? bookDailySeries(store.records, bookTitle) : [];
 
     if (!series.length) {
       const pendingBook = bookTitle && (Array.isArray(store.pendingBooks) ? store.pendingBooks : []).find((p) => p.title === bookTitle);
@@ -1935,7 +1959,7 @@ function normalizeListItems(items) {
         showToast('请先选择一本书', 'warn');
         return;
       }
-      buildBookSeries(store.records, bookTitle).forEach((s) => {
+      bookDailySeries(store.records, bookTitle).forEach((s) => {
         const book = s.book;
         rows.push([
           s.date,
